@@ -24,20 +24,12 @@ from openpyxl.utils import get_column_letter
 load_dotenv()
 colorama_init(autoreset=True)
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
 TIMEOUT = 15
 
-PASS = "✓"
-FAIL = "✗"
+PASS   = "✓"
+FAIL   = "✗"
 MANUAL = "Manual"
-NA = "N/A"
+NA     = "N/A"
 
 
 # ── Result dataclass ──────────────────────────────────────────────────────────
@@ -49,53 +41,99 @@ class PropertyResult:
     apartments_com: str
     facebook: str
 
-    link_book_tour: str = NA
+    link_book_tour: str    = NA
     link_virtual_tour: str = NA
-    link_application: str = NA
+    link_application: str  = NA
     link_social_media: str = NA
-    link_menus: str = NA
+    link_menus: str        = NA
 
     address_consistent: str = NA
-    address_website: str = ""
-    address_ils: str = ""
-    address_note: str = ""
+    address_website: str    = ""
+    address_ils: str        = ""
+    address_note: str       = ""
 
     facebook_active: str = NA
-    facebook_note: str = ""
+    facebook_note: str   = ""
 
     pricing_consistent: str = NA
-    pricing_website: str = ""
-    pricing_ils: str = ""
+    pricing_website: str    = ""
+    pricing_ils: str        = ""
 
-    specials_on_ils: str = NA
+    specials_on_ils: str     = NA
     specials_on_website: str = NA
 
-    specials_consistent: str = NA
-    specials_ils_text: str = ""
+    specials_consistent: str   = NA
+    specials_ils_text: str     = ""
     specials_website_text: str = ""
 
-    google_rating: str = NA
-    google_review_count: str = NA
-    google_recent_feedback: str = MANUAL
+    google_rating: str        = NA
+    google_review_count: str  = NA
+    google_recent_feedback: str  = MANUAL
     google_reviews_responded: str = MANUAL
 
 
-# ── Playwright fetcher (primary) ──────────────────────────────────────────────
+# ── Playwright fetcher ────────────────────────────────────────────────────────
 
-def fetch_with_playwright(url: str, wait_ms: int = 3000) -> Optional[str]:
-    """Render a page with headless Chromium and return the full HTML."""
+def fetch_with_playwright(url: str, wait_ms: int = 4000, scroll: bool = True) -> Optional[str]:
+    """
+    Render a page with headless Chromium.
+    - Spoofs common bot-detection signals
+    - Scrolls to the bottom so lazy-loaded footer/widgets appear
+    """
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            )
             ctx = browser.new_context(
                 ignore_https_errors=True,
-                user_agent=HEADERS["User-Agent"],
-                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 900},
+                extra_http_headers={
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                },
+            )
+            # Hide webdriver flag that sites use to detect bots
+            ctx.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
             )
             page = ctx.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(wait_ms)   # let JS frameworks finish rendering
+            page.goto(url, wait_until="domcontentloaded", timeout=40000)
+            page.wait_for_timeout(wait_ms)
+
+            if scroll:
+                # Scroll gradually to trigger lazy-loaded content (footer, widgets)
+                page.evaluate("""
+                    async () => {
+                        await new Promise(resolve => {
+                            let y = 0;
+                            const step = 300;
+                            const delay = 150;
+                            const timer = setInterval(() => {
+                                window.scrollBy(0, step);
+                                y += step;
+                                if (y >= document.body.scrollHeight) {
+                                    clearInterval(timer);
+                                    window.scrollTo(0, 0);
+                                    resolve();
+                                }
+                            }, delay);
+                        });
+                    }
+                """)
+                page.wait_for_timeout(2000)  # wait for any lazy content to render
+
             html = page.content()
             browser.close()
             return html
@@ -105,105 +143,102 @@ def fetch_with_playwright(url: str, wait_ms: int = 3000) -> Optional[str]:
 
 
 def fetch(url: str) -> Optional[BeautifulSoup]:
-    """Fetch page HTML → BeautifulSoup. Uses Playwright so JS content is included."""
-    # Try plain requests first (fast path for non-JS pages)
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
-        if resp.status_code < 400 and len(resp.text) > 1000:
-            soup = BeautifulSoup(resp.text, "lxml")
-            page_text = soup.get_text()
-            # If the page looks like a real site (has links/nav), use it
-            if len(soup.find_all("a")) > 5:
-                return soup
-    except Exception:
-        pass
-
-    # Fall back to Playwright for JS-rendered sites
-    print(f"    {Fore.YELLOW}Using Playwright for {url}{Style.RESET_ALL}")
     html = fetch_with_playwright(url)
     return BeautifulSoup(html, "lxml") if html else None
 
 
-def check_url_alive(url: str) -> bool:
-    try:
-        r = requests.head(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
-        if r.status_code == 405:
-            r = requests.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
-        return r.status_code < 400
-    except Exception:
-        return False
+# ── Item 1: Link / Button / Widget checks ────────────────────────────────────
+
+# Third-party platforms whose presence on the page signals a feature works
+BOOKING_PLATFORMS  = ["quext", "rentcafe", "funnel", "knock", "appfolio",
+                      "yardi", "realpage", "entrata", "resman", "leasestar",
+                      "scheduleatour", "tourschedule", "selfguidedtour"]
+APPLY_PLATFORMS    = ["rentcafe", "appfolio", "yardi", "realpage", "entrata",
+                      "resman", "leasestar", "mynd", "buildium", "cozy"]
+SOCIAL_DOMAINS     = ["facebook.com", "fb.com", "instagram.com", "twitter.com",
+                      "x.com", "linkedin.com", "youtube.com", "tiktok.com"]
+VIRTUAL_TOUR_SRCS  = ["matterport", "kuula", "3dvista", "roundme", "vtour",
+                      "virtualtour", "virtual-tour", "3d-tour", "iguide"]
+
+BOOK_TOUR_TEXT_RE = re.compile(
+    r"book\s*a?\s*tour|schedule\s*a?\s*tour|request\s*a?\s*tour|"
+    r"in[\s\-]?person\s*tour|self[\s\-]?guided|come\s*and\s*tour|"
+    r"tour\s*now|tour\s*today",
+    re.IGNORECASE,
+)
+APPLY_TEXT_RE = re.compile(
+    r"apply\s*now|apply\s*online|lease\s*now|lease\s*online|"
+    r"start\s*application|apply\s*today|application\b|resident\s*portal",
+    re.IGNORECASE,
+)
+VIRTUAL_TOUR_TEXT_RE = re.compile(
+    r"virtual\s*tour|3d\s*tour|take\s*a\s*tour\s*online|tour\s*from\s*home",
+    re.IGNORECASE,
+)
+MENU_TEXT_RE = re.compile(
+    r"\bamenities\b|\bfloor\s*plans?\b|\bgallery\b|\bcontact\b|\bphotos?\b|"
+    r"\bneighborhood\b|\blifestyle\b|\bmap\b|\babout\b",
+    re.IGNORECASE,
+)
 
 
-# ── Item 1: Link / Button Checks ──────────────────────────────────────────────
+def _page_contains(soup: BeautifulSoup, text_re, platform_list: list[str] = None) -> bool:
+    """
+    Return True if any <a>, <button>, script src, or iframe src matches.
+    Checks visible text, href, onclick, aria-label, and external script/iframe sources.
+    """
+    full_html = str(soup).lower()
 
-# Patterns to detect each link type in href or visible text
-LINK_PATTERNS = {
-    "book_tour": [
-        r"book[\s\-_]?a[\s\-_]?tour", r"schedule[\s\-_]?a[\s\-_]?tour",
-        r"request[\s\-_]?a[\s\-_]?tour", r"in[\s\-_]?person[\s\-_]?tour",
-        r"self[\s\-_]?guided[\s\-_]?tour", r"come[\s\-_]?and[\s\-_]?tour",
-    ],
-    "virtual_tour": [
-        r"virtual[\s\-_]?tour", r"3d[\s\-_]?tour", r"matterport",
-        r"floorplan.*tour", r"tour.*3d",
-    ],
-    "application": [
-        r"apply[\s\-_]?now", r"apply[\s\-_]?online", r"\bapplication\b",
-        r"resident[\s\-_]?portal", r"renter[\s\-_]?portal",
-        r"lease[\s\-_]?now", r"lease[\s\-_]?online", r"start[\s\-_]?application",
-    ],
-    "social_media": [
-        r"facebook\.com", r"fb\.com", r"instagram\.com", r"twitter\.com",
-        r"x\.com/(?!share)", r"linkedin\.com", r"youtube\.com",
-    ],
-    "menus": [
-        r"\bamenities\b", r"floor[\s\-_]?plans?", r"\bgallery\b",
-        r"\bcontact\b", r"\babout\b", r"\bphotos\b", r"\bneighborhood\b",
-        r"\blifestyle\b", r"\bmap\b",
-    ],
-}
+    # Check script/iframe sources for third-party platforms
+    if platform_list:
+        for src_tag in soup.find_all(["script", "iframe"], src=True):
+            src = (src_tag.get("src") or "").lower()
+            if any(p in src for p in platform_list):
+                return True
+        # Also check raw HTML for platform names (some load via JS variables)
+        if any(p in full_html for p in platform_list):
+            return True
 
+    # Check all clickable elements
+    for el in soup.find_all(["a", "button", "div", "span"]):
+        text  = el.get_text(" ", strip=True)
+        href  = el.get("href", "") or ""
+        aria  = el.get("aria-label", "") or ""
+        onclick = el.get("onclick", "") or ""
+        combined = " ".join([text, href, aria, onclick])
+        if text_re and text_re.search(combined):
+            return True
 
-def _element_text_and_href(el) -> str:
-    """Return combined href + text content of a tag for pattern matching."""
-    href = el.get("href", "") or ""
-    text = el.get_text(" ", strip=True)
-    onclick = el.get("onclick", "") or ""
-    aria = el.get("aria-label", "") or ""
-    return (href + " " + text + " " + onclick + " " + aria).lower()
+    return False
 
 
 def check_links(soup: BeautifulSoup, base_url: str, has_virtual_tour: bool = True) -> dict[str, str]:
     results = {}
 
-    # Collect both <a> and <button> elements — many sites use buttons for tour modals
-    clickables = soup.find_all(["a", "button"])
-
-    def find_match(patterns: list[str]) -> bool:
-        for el in clickables:
-            combined = _element_text_and_href(el)
-            for pat in patterns:
-                if re.search(pat, combined, re.IGNORECASE):
-                    # For <a> tags verify the href is alive; buttons are always ✓
-                    if el.name == "button":
-                        return True
-                    href = el.get("href", "")
-                    if not href or href.startswith("#") or href.startswith("javascript"):
-                        return True   # JS-triggered modal / anchor — assume works
-                    full_url = urllib.parse.urljoin(base_url, href)
-                    return check_url_alive(full_url)
-        return False
-
-    results["book_tour"] = PASS if find_match(LINK_PATTERNS["book_tour"]) else FAIL
+    results["book_tour"] = (
+        PASS if _page_contains(soup, BOOK_TOUR_TEXT_RE, BOOKING_PLATFORMS) else FAIL
+    )
 
     if not has_virtual_tour:
         results["virtual_tour"] = "N/A"
     else:
-        results["virtual_tour"] = PASS if find_match(LINK_PATTERNS["virtual_tour"]) else FAIL
+        results["virtual_tour"] = (
+            PASS if _page_contains(soup, VIRTUAL_TOUR_TEXT_RE, VIRTUAL_TOUR_SRCS) else FAIL
+        )
 
-    results["application"] = PASS if find_match(LINK_PATTERNS["application"]) else FAIL
-    results["social_media"] = PASS if find_match(LINK_PATTERNS["social_media"]) else FAIL
-    results["menus"] = PASS if find_match(LINK_PATTERNS["menus"]) else FAIL
+    results["application"] = (
+        PASS if _page_contains(soup, APPLY_TEXT_RE, APPLY_PLATFORMS) else FAIL
+    )
+
+    # Social media: check raw HTML for social domain names (fastest, most reliable)
+    full_html = str(soup).lower()
+    results["social_media"] = (
+        PASS if any(domain in full_html for domain in SOCIAL_DOMAINS) else FAIL
+    )
+
+    results["menus"] = (
+        PASS if _page_contains(soup, MENU_TEXT_RE) else FAIL
+    )
 
     return results
 
@@ -256,22 +291,26 @@ def check_address(website_soup, ils_soup) -> tuple[str, str, str, str]:
 
 def check_facebook(fb_url: str) -> tuple[str, str]:
     try:
-        resp = requests.get(fb_url, headers=HEADERS, timeout=TIMEOUT)
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        resp = requests.get(fb_url, headers=headers, timeout=TIMEOUT)
         if resp.status_code == 200:
             text = resp.text.lower()
             if "log in" in text and "timeline" not in text:
                 return MANUAL, "Facebook login required – check manually"
-            today = datetime.date.today()
-            week_ago = today - datetime.timedelta(days=7)
-            dates_found = re.findall(r"(\d{4}-\d{2}-\d{2})", resp.text)
-            recent = any(
-                _safe_date(d) is not None and _safe_date(d) >= week_ago
-                for d in dates_found
-            )
-            if recent:
+            today     = datetime.date.today()
+            week_ago  = today - datetime.timedelta(days=7)
+            dates     = re.findall(r"(\d{4}-\d{2}-\d{2})", resp.text)
+            if any(_safe_date(d) and _safe_date(d) >= week_ago for d in dates):
                 return PASS, "Recent posts detected"
-            if dates_found:
-                return FAIL, f"No posts within last 7 days"
+            if dates:
+                return FAIL, "No posts within last 7 days"
     except Exception:
         pass
     return MANUAL, f"Facebook blocked scraping – check manually: {fb_url}"
@@ -292,7 +331,7 @@ def normalize_price(s: str) -> int:
 
 
 def find_price_range(soup: BeautifulSoup) -> tuple[Optional[int], Optional[int]]:
-    text = soup.get_text(" ", strip=True)
+    text   = soup.get_text(" ", strip=True)
     prices = re.findall(r"\$[\d,]+", text)
     values = [normalize_price(p) for p in prices if 500 <= normalize_price(p) <= 10000]
     if not values:
@@ -302,75 +341,75 @@ def find_price_range(soup: BeautifulSoup) -> tuple[Optional[int], Optional[int]]
 
 def check_pricing(website_soup, ils_soup) -> tuple[str, str, str]:
     w_min, w_max = find_price_range(website_soup) if website_soup else (None, None)
-    i_min, i_max = find_price_range(ils_soup) if ils_soup else (None, None)
+    i_min, i_max = find_price_range(ils_soup)     if ils_soup     else (None, None)
+    w_str = f"${w_min:,}–${w_max:,}" if w_min else "N/A"
+    i_str = f"${i_min:,}–${i_max:,}" if i_min else "N/A"
     if None in (w_min, w_max, i_min, i_max):
-        w_str = f"${w_min:,}–${w_max:,}" if w_min else "N/A"
-        i_str = f"${i_min:,}–${i_max:,}" if i_min else "N/A"
         return MANUAL, w_str, i_str
-    w_str = f"${w_min:,}–${w_max:,}"
-    i_str = f"${i_min:,}–${i_max:,}"
-    threshold = 100
-    consistent = PASS if abs(w_min - i_min) <= threshold and abs(w_max - i_max) <= threshold else FAIL
+    consistent = PASS if abs(w_min - i_min) <= 100 and abs(w_max - i_max) <= 100 else FAIL
     return consistent, w_str, i_str
 
 
 # ── Items 5 & 6: Specials ─────────────────────────────────────────────────────
 
-SPECIAL_KEYWORDS = [
-    r"\d+\s*weeks?\s+free",
-    r"\d+\s*months?\s+free",
-    r"weeks?\s+free\s+(?:base\s+)?rent",
-    r"months?\s+free\s+(?:base\s+)?rent",
-    r"move[\s\-]?in\s+special",
-    r"pre[\s\-]?leasing\s+special",
-    r"summer\s+savings",
-    r"look\s*&\s*lease",
-    r"gift\s+card",
-    r"concession",
-    r"reduced\s+rent",
-    r"limited\s+time",
-    r"waived\s+fee",
-    r"\d+\s*%\s+off",
-    r"free\s+rent",
+SPECIAL_RE = re.compile(
+    r"\d+\s*weeks?\s+free|"
+    r"\d+\s*months?\s+free|"
+    r"weeks?\s+free\s+(?:base\s+)?rent|"
+    r"months?\s+free\s+(?:base\s+)?rent|"
+    r"move[\s\-]?in\s+special|"
+    r"pre[\s\-]?leasing\s+special|"
+    r"leasing\s+special|"
+    r"rent\s+special|"
+    r"summer\s+savings|"
+    r"look\s*&\s*lease|"
+    r"gift\s+card|"
+    r"concession|"
+    r"reduced\s+rent|"
+    r"waived\s+(?:admin\s+)?fee|"
+    r"\d+\s*%\s+off\s+rent|"
+    r"free\s+(?:base\s+)?rent|"
     r"special\s+offer",
-    r"leasing\s+special",
-    r"rent\s+special",
-]
-SPECIAL_RE = re.compile("|".join(SPECIAL_KEYWORDS), re.IGNORECASE)
+    re.IGNORECASE,
+)
 
 
 def find_special_text(soup: BeautifulSoup) -> str:
     if not soup:
         return ""
-    # Check banner/announcement bar elements first (most prominent)
-    for selector in ["[class*='banner']", "[class*='promo']", "[class*='special']",
-                     "[class*='offer']", "[class*='alert']", "[class*='announcement']",
-                     "header", "nav", ".hero", "#hero"]:
+    # Priority: check banner/announcement/promo elements first
+    priority_selectors = [
+        "[class*='banner']", "[class*='promo']", "[class*='special']",
+        "[class*='offer']",  "[class*='alert']", "[class*='announcement']",
+        "[class*='notice']", "[class*='ribbon']", "[class*='hero']",
+        "header", "nav",
+    ]
+    for sel in priority_selectors:
         try:
-            els = soup.select(selector)
-            for el in els:
+            for el in soup.select(sel):
                 text = el.get_text(" ", strip=True)
-                if SPECIAL_RE.search(text):
-                    m = SPECIAL_RE.search(text)
-                    start = max(0, m.start() - 40)
-                    end = min(len(text), m.end() + 120)
-                    return text[start:end].strip()
+                m = SPECIAL_RE.search(text)
+                if m:
+                    s = max(0, m.start() - 40)
+                    e = min(len(text), m.end() + 150)
+                    return text[s:e].strip()
         except Exception:
             pass
 
-    # Fall back to full page text
+    # Fall back to full page
     text = soup.get_text(" ", strip=True)
     m = SPECIAL_RE.search(text)
     if m:
-        start = max(0, m.start() - 40)
-        end = min(len(text), m.end() + 120)
-        return text[start:end].strip()
+        s = max(0, m.start() - 40)
+        e = min(len(text), m.end() + 150)
+        return text[s:e].strip()
     return ""
 
 
 def specials_similar(a: str, b: str) -> bool:
-    def tokens(s: str) -> set:
-        return set(re.findall(r"\w+", s.lower())) - {"and", "or", "the", "a", "an", "in", "of", "to"}
+    stop = {"and", "or", "the", "a", "an", "in", "of", "to", "on", "at", "for"}
+    def tokens(s):
+        return set(re.findall(r"\w+", s.lower())) - stop
     ta, tb = tokens(a), tokens(b)
     if not ta or not tb:
         return False
@@ -410,7 +449,7 @@ def get_google_reviews(place_name: str) -> tuple[str, str]:
 # ── Main per-property review ──────────────────────────────────────────────────
 
 def review_property(prop: dict) -> PropertyResult:
-    name = prop["name"]
+    name             = prop["name"]
     has_virtual_tour = prop.get("has_virtual_tour", True)
 
     print(f"\n{Fore.CYAN}{'='*60}")
@@ -424,58 +463,54 @@ def review_property(prop: dict) -> PropertyResult:
         facebook=prop["facebook"],
     )
 
-    print(f"  Fetching website (Playwright)...")
-    website_html = fetch_with_playwright(prop["website"], wait_ms=4000)
+    print(f"  Fetching website (Playwright + scroll)...")
+    website_html = fetch_with_playwright(prop["website"], wait_ms=5000, scroll=True)
     website_soup = BeautifulSoup(website_html, "lxml") if website_html else None
 
-    print(f"  Fetching apartments.com (Playwright)...")
-    ils_html = fetch_with_playwright(prop["apartments_com"], wait_ms=4000)
+    print(f"  Fetching apartments.com (Playwright + stealth)...")
+    ils_html = fetch_with_playwright(prop["apartments_com"], wait_ms=5000, scroll=True)
     ils_soup = BeautifulSoup(ils_html, "lxml") if ils_html else None
 
-    # Item 1: Links & buttons
+    # Item 1
     print(f"  Checking links/buttons (1.1–1.5)...")
     if website_soup:
         lr = check_links(website_soup, prop["website"], has_virtual_tour)
-        result.link_book_tour = lr["book_tour"]
+        result.link_book_tour    = lr["book_tour"]
         result.link_virtual_tour = lr["virtual_tour"]
-        result.link_application = lr["application"]
+        result.link_application  = lr["application"]
         result.link_social_media = lr["social_media"]
-        result.link_menus = lr["menus"]
+        result.link_menus        = lr["menus"]
     else:
-        for attr in ["link_book_tour", "link_virtual_tour", "link_application",
-                     "link_social_media", "link_menus"]:
+        for attr in ["link_book_tour","link_virtual_tour","link_application",
+                     "link_social_media","link_menus"]:
             setattr(result, attr, FAIL)
 
-    # Item 2: Address
+    # Item 2
     print(f"  Checking address (item 2)...")
     consistent, addr_web, addr_ils, note = check_address(website_soup, ils_soup)
     result.address_consistent = consistent
-    result.address_website = addr_web
-    result.address_ils = addr_ils
-    result.address_note = (note + " | Google & Facebook: check manually").strip(" |")
+    result.address_website    = addr_web
+    result.address_ils        = addr_ils
+    result.address_note       = (note + " | Google & Facebook: check manually").strip(" |")
 
-    # Item 3: Facebook
+    # Item 3
     print(f"  Checking Facebook (item 3)...")
-    fb_status, fb_note = check_facebook(prop["facebook"])
-    result.facebook_active = fb_status
-    result.facebook_note = fb_note
+    result.facebook_active, result.facebook_note = check_facebook(prop["facebook"])
 
-    # Item 4: Pricing
+    # Item 4
     print(f"  Checking pricing (item 4)...")
-    pricing_status, pricing_web, pricing_ils = check_pricing(website_soup, ils_soup)
-    result.pricing_consistent = pricing_status
-    result.pricing_website = pricing_web
-    result.pricing_ils = pricing_ils
+    result.pricing_consistent, result.pricing_website, result.pricing_ils = (
+        check_pricing(website_soup, ils_soup)
+    )
 
-    # Items 5 & 6: Specials
+    # Items 5 & 6
     print(f"  Checking specials (items 5–6)...")
-    special_ils = find_special_text(ils_soup) if ils_soup else ""
+    special_ils = find_special_text(ils_soup)   if ils_soup     else ""
     special_web = find_special_text(website_soup) if website_soup else ""
-    result.specials_on_ils = PASS if special_ils else FAIL
-    result.specials_on_website = PASS if special_web else FAIL
-    result.specials_ils_text = special_ils[:250]
+    result.specials_on_ils      = PASS if special_ils else FAIL
+    result.specials_on_website  = PASS if special_web else FAIL
+    result.specials_ils_text    = special_ils[:250]
     result.specials_website_text = special_web[:250]
-
     if special_ils and special_web:
         result.specials_consistent = PASS if specials_similar(special_ils, special_web) else FAIL
     elif not special_ils and not special_web:
@@ -483,9 +518,11 @@ def review_property(prop: dict) -> PropertyResult:
     else:
         result.specials_consistent = FAIL
 
-    # Item 7: Google
+    # Item 7
     print(f"  Fetching Google reviews (item 7)...")
-    result.google_rating, result.google_review_count = get_google_reviews(prop["google_place_name"])
+    result.google_rating, result.google_review_count = (
+        get_google_reviews(prop["google_place_name"])
+    )
 
     return result
 
@@ -493,12 +530,9 @@ def review_property(prop: dict) -> PropertyResult:
 # ── Console output ────────────────────────────────────────────────────────────
 
 def color_status(value: str) -> str:
-    if value == PASS:
-        return f"{Fore.GREEN}{value}{Style.RESET_ALL}"
-    if value == FAIL:
-        return f"{Fore.RED}{value}{Style.RESET_ALL}"
-    if value == MANUAL:
-        return f"{Fore.YELLOW}{value}{Style.RESET_ALL}"
+    if value == PASS:   return f"{Fore.GREEN}{value}{Style.RESET_ALL}"
+    if value == FAIL:   return f"{Fore.RED}{value}{Style.RESET_ALL}"
+    if value == MANUAL: return f"{Fore.YELLOW}{value}{Style.RESET_ALL}"
     return value
 
 
@@ -509,58 +543,58 @@ def print_result(r: PropertyResult):
 
     print(f"\n  {Fore.WHITE}{Style.BRIGHT}{r.name}{Style.RESET_ALL}")
     print(f"  {'-'*56}")
-    row("1.1 Book a Tour", r.link_book_tour)
-    row("1.2 Virtual Tour", r.link_virtual_tour)
-    row("1.3 Application", r.link_application)
-    row("1.4 Social Media Links", r.link_social_media)
-    row("1.5 Menus", r.link_menus)
-    row("2.  Address Consistent", r.address_consistent, r.address_note)
-    row("3.  Facebook Active", r.facebook_active, r.facebook_note)
+    row("1.1 Book a Tour",          r.link_book_tour)
+    row("1.2 Virtual Tour",         r.link_virtual_tour)
+    row("1.3 Application",          r.link_application)
+    row("1.4 Social Media Links",   r.link_social_media)
+    row("1.5 Menus",                r.link_menus)
+    row("2.  Address Consistent",   r.address_consistent, r.address_note)
+    row("3.  Facebook Active",      r.facebook_active,    r.facebook_note)
     row("4.  ILS/Website Pricing",  r.pricing_consistent,
         f"Web: {r.pricing_website} | ILS: {r.pricing_ils}" if r.pricing_website else "")
-    row("5a. Specials on ILS", r.specials_on_ils, r.specials_ils_text[:80])
-    row("5b. Specials on Website", r.specials_on_website, r.specials_website_text[:80])
-    row("6.  Specials Consistent", r.specials_consistent)
-    row("7.1 Google Rating", r.google_rating)
-    row("    Google Review Count", r.google_review_count)
-    row("7.2 Recent Feedback", r.google_recent_feedback)
+    row("5a. Specials on ILS",      r.specials_on_ils,      r.specials_ils_text[:80])
+    row("5b. Specials on Website",  r.specials_on_website,  r.specials_website_text[:80])
+    row("6.  Specials Consistent",  r.specials_consistent)
+    row("7.1 Google Rating",        r.google_rating)
+    row("    Google Review Count",  r.google_review_count)
+    row("7.2 Recent Feedback",      r.google_recent_feedback)
     row("7.4 Reviews Responded To", r.google_reviews_responded)
 
 
 # ── Excel report ──────────────────────────────────────────────────────────────
 
-GREEN_FILL   = PatternFill("solid", fgColor="C6EFCE")
-RED_FILL     = PatternFill("solid", fgColor="FFC7CE")
-YELLOW_FILL  = PatternFill("solid", fgColor="FFEB9C")
-HEADER_FILL  = PatternFill("solid", fgColor="2E4057")
-SUBHDR_FILL  = PatternFill("solid", fgColor="4A6FA5")
-WHITE_FONT   = Font(color="FFFFFF", bold=True)
-BOLD_FONT    = Font(bold=True)
-CENTER       = Alignment(horizontal="center", vertical="center", wrap_text=True)
-THIN_BORDER  = Border(
+GREEN_FILL  = PatternFill("solid", fgColor="C6EFCE")
+RED_FILL    = PatternFill("solid", fgColor="FFC7CE")
+YELLOW_FILL = PatternFill("solid", fgColor="FFEB9C")
+HEADER_FILL = PatternFill("solid", fgColor="2E4057")
+SUBHDR_FILL = PatternFill("solid", fgColor="4A6FA5")
+WHITE_FONT  = Font(color="FFFFFF", bold=True)
+BOLD_FONT   = Font(bold=True)
+CENTER      = Alignment(horizontal="center", vertical="center", wrap_text=True)
+THIN_BORDER = Border(
     left=Side(style="thin"), right=Side(style="thin"),
     top=Side(style="thin"),  bottom=Side(style="thin"),
 )
 
 ROWS = [
-    ("1",   "Are the links working?",                         None,                    True),
-    ("1.1", "Book a Tour",                                    "link_book_tour",         False),
-    ("1.2", "Virtual Tour",                                   "link_virtual_tour",      False),
-    ("1.3", "Application",                                    "link_application",       False),
-    ("1.4", "Links to Social Media",                          "link_social_media",      False),
-    ("1.5", "Menus",                                          "link_menus",             False),
-    ("2",   "Address all correct?",                           "address_consistent",     False),
-    ("3",   "Social Media Active?",                           "facebook_active",        False),
-    ("4",   "ILS and Website pricing consistent?",            "pricing_consistent",     False),
-    ("5",   "Specials displayed in ILS and Website?",         None,                    True),
-    ("5a",  "Specials on ILS (apartments.com)",               "specials_on_ils",        False),
-    ("5b",  "Specials on Website",                            "specials_on_website",    False),
-    ("6",   "Specials consistent in ILS and Website?",        "specials_consistent",   False),
-    ("7",   "Google Reviews",                                 None,                    True),
-    ("7.1", "What is the current Google rating?",             "google_rating",          False),
-    ("7.2", "Is recent feedback generally positive/negative?","google_recent_feedback", False),
-    ("7.3", "How many reviews received last week?",           "google_review_count",    False),
-    ("7.4", "Are reviews being responded to?",                "google_reviews_responded",False),
+    ("1",   "Are the links working?",                          None,                     True),
+    ("1.1", "Book a Tour",                                     "link_book_tour",          False),
+    ("1.2", "Virtual Tour",                                    "link_virtual_tour",       False),
+    ("1.3", "Application",                                     "link_application",        False),
+    ("1.4", "Links to Social Media",                           "link_social_media",       False),
+    ("1.5", "Menus",                                           "link_menus",              False),
+    ("2",   "Address all correct?",                            "address_consistent",      False),
+    ("3",   "Social Media Active?",                            "facebook_active",         False),
+    ("4",   "ILS and Website pricing consistent?",             "pricing_consistent",      False),
+    ("5",   "Specials displayed in ILS and Website?",          None,                      True),
+    ("5a",  "Specials on ILS (apartments.com)",                "specials_on_ils",         False),
+    ("5b",  "Specials on Website",                             "specials_on_website",     False),
+    ("6",   "Specials consistent in ILS and Website?",         "specials_consistent",     False),
+    ("7",   "Google Reviews",                                  None,                      True),
+    ("7.1", "What is the current Google rating?",              "google_rating",           False),
+    ("7.2", "Is recent feedback generally positive/negative?", "google_recent_feedback",  False),
+    ("7.3", "How many reviews received last week?",            "google_review_count",     False),
+    ("7.4", "Are reviews being responded to?",                 "google_reviews_responded",False),
 ]
 
 
@@ -576,27 +610,22 @@ def write_excel(results: list[PropertyResult], filename: str):
     ws = wb.active
     ws.title = "Weekly Review"
 
-    today_str = datetime.date.today().strftime("%B %d, %Y")
     ws.merge_cells("A1:B1")
-    ws["A1"] = f"As of {today_str}"
+    ws["A1"] = f"As of {datetime.date.today().strftime('%B %d, %Y')}"
     ws["A1"].font = BOLD_FONT
 
-    # Header row
-    ws["A2"] = "Item"
-    ws["B2"] = "Things to Check"
-    for c, r in enumerate(results, start=3):
-        cell = ws.cell(row=2, column=c, value=r.name)
-        cell.fill = HEADER_FILL
-        cell.font = WHITE_FONT
-        cell.alignment = CENTER
-        cell.border = THIN_BORDER
-    for col in ["A2", "B2"]:
+    for col, hdr in [("A2","Item"), ("B2","Things to Check")]:
+        ws[col] = hdr
         ws[col].fill = HEADER_FILL
         ws[col].font = WHITE_FONT
         ws[col].alignment = CENTER
         ws[col].border = THIN_BORDER
 
-    # Data rows
+    for c, r in enumerate(results, start=3):
+        cell = ws.cell(row=2, column=c, value=r.name)
+        cell.fill = HEADER_FILL; cell.font = WHITE_FONT
+        cell.alignment = CENTER;  cell.border = THIN_BORDER
+
     for ri, (item, desc, attr, is_header) in enumerate(ROWS, start=3):
         a = ws.cell(row=ri, column=1, value=item)
         b = ws.cell(row=ri, column=2, value=desc)
@@ -607,12 +636,10 @@ def write_excel(results: list[PropertyResult], filename: str):
             b.font = BOLD_FONT
         a.border = THIN_BORDER
         b.border = THIN_BORDER
-
         for ci, r in enumerate(results, start=3):
-            val = getattr(r, attr, "") if attr else ""
+            val  = getattr(r, attr, "") if attr else ""
             cell = ws.cell(row=ri, column=ci, value=val)
-            cell.alignment = CENTER
-            cell.border = THIN_BORDER
+            cell.alignment = CENTER; cell.border = THIN_BORDER
             if attr:
                 fill = _status_fill(val)
                 if fill:
@@ -623,22 +650,19 @@ def write_excel(results: list[PropertyResult], filename: str):
     for ci in range(3, 3 + len(results)):
         ws.column_dimensions[get_column_letter(ci)].width = 18
 
-    # Notes sheet
     ws2 = wb.create_sheet("Notes & Details")
-    for ci, hdr in enumerate(["Property", "Item", "Detail"], start=1):
+    for ci, hdr in enumerate(["Property","Item","Detail"], start=1):
         c = ws2.cell(row=1, column=ci, value=hdr)
-        c.fill = HEADER_FILL
-        c.font = WHITE_FONT
+        c.fill = HEADER_FILL; c.font = WHITE_FONT
     nr = 2
     for r in results:
-        notes = [
+        for pname, itm, detail in [
             (r.name, "2. Address",          f"Website: {r.address_website} | ILS: {r.address_ils} | {r.address_note}"),
             (r.name, "3. Facebook",         r.facebook_note),
             (r.name, "4. Pricing",          f"Website: {r.pricing_website} | ILS: {r.pricing_ils}"),
             (r.name, "5a. ILS Special",     r.specials_ils_text),
             (r.name, "5b. Website Special", r.specials_website_text),
-        ]
-        for pname, itm, detail in notes:
+        ]:
             if detail.strip():
                 ws2.cell(row=nr, column=1, value=pname)
                 ws2.cell(row=nr, column=2, value=itm)
@@ -647,7 +671,6 @@ def write_excel(results: list[PropertyResult], filename: str):
     ws2.column_dimensions["A"].width = 22
     ws2.column_dimensions["B"].width = 20
     ws2.column_dimensions["C"].width = 90
-
     wb.save(filename)
     print(f"\n{Fore.GREEN}Excel report saved: {filename}{Style.RESET_ALL}")
 
@@ -660,8 +683,7 @@ def main():
     parser = argparse.ArgumentParser(description="Weekly property website review")
     parser.add_argument("--property", "-p",
                         help="Single property name (partial match, case-insensitive)")
-    parser.add_argument("--no-excel", action="store_true",
-                        help="Skip Excel report")
+    parser.add_argument("--no-excel", action="store_true")
     args = parser.parse_args()
 
     props = PROPERTIES
@@ -673,21 +695,19 @@ def main():
             sys.exit(1)
 
     print(f"\n{Fore.WHITE}{Style.BRIGHT}Weekly Property Review — {datetime.date.today()}{Style.RESET_ALL}")
-    print(f"Reviewing {len(props)} propert{'y' if len(props)==1 else 'ies'}...\n")
-    print(f"{Fore.YELLOW}Note: Uses Playwright (headless browser) — expect ~2 min per property.{Style.RESET_ALL}\n")
+    print(f"Reviewing {len(props)} propert{'y' if len(props)==1 else 'ies'}...")
+    print(f"{Fore.YELLOW}Note: ~3 min per property (Playwright renders each page fully).{Style.RESET_ALL}\n")
 
     results = []
     for prop in props:
         try:
-            result = review_property(prop)
-            results.append(result)
-            print_result(result)
+            results.append(review_property(prop))
+            print_result(results[-1])
         except Exception as exc:
             print(f"{Fore.RED}ERROR reviewing {prop['name']}: {exc}{Style.RESET_ALL}")
 
     if not args.no_excel and results:
-        filename = f"report_{datetime.date.today().isoformat()}.xlsx"
-        write_excel(results, filename)
+        write_excel(results, f"report_{datetime.date.today().isoformat()}.xlsx")
 
     print(f"\n{Fore.WHITE}{Style.BRIGHT}Review complete.{Style.RESET_ALL}\n")
 
