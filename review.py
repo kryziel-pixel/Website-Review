@@ -76,9 +76,8 @@ class PropertyResult:
 
 def fetch_with_playwright(url: str, wait_ms: int = 4000, scroll: bool = True) -> Optional[str]:
     """
-    Render a page with headless Chromium.
-    - Spoofs common bot-detection signals
-    - Scrolls to the bottom so lazy-loaded footer/widgets appear
+    Render a page with headless Chromium using strong anti-bot-detection measures.
+    Scrolls gradually so lazy-loaded content (footer, widgets, specials) appears.
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -89,6 +88,8 @@ def fetch_with_playwright(url: str, wait_ms: int = 4000, scroll: bool = True) ->
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
+                    "--disable-web-security",
+                    "--disable-features=IsolateOrigins,site-per-process",
                 ],
             )
             ctx = browser.new_context(
@@ -98,28 +99,40 @@ def fetch_with_playwright(url: str, wait_ms: int = 4000, scroll: bool = True) ->
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/124.0.0.0 Safari/537.36"
                 ),
-                viewport={"width": 1280, "height": 900},
+                viewport={"width": 1440, "height": 900},
+                locale="en-US",
+                timezone_id="America/Chicago",
                 extra_http_headers={
                     "Accept-Language": "en-US,en;q=0.9",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Sec-Fetch-User": "?1",
+                    "Upgrade-Insecure-Requests": "1",
                 },
             )
-            # Hide webdriver flag that sites use to detect bots
-            ctx.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-            )
+            # Comprehensive webdriver/automation hiding
+            ctx.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+                window.chrome = {runtime: {}};
+            """)
             page = ctx.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=40000)
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(wait_ms)
 
             if scroll:
-                # Scroll gradually to trigger lazy-loaded content (footer, widgets)
                 page.evaluate("""
                     async () => {
                         await new Promise(resolve => {
                             let y = 0;
-                            const step = 300;
-                            const delay = 150;
+                            const step = 400;
+                            const delay = 200;
                             const timer = setInterval(() => {
                                 window.scrollBy(0, step);
                                 y += step;
@@ -132,7 +145,7 @@ def fetch_with_playwright(url: str, wait_ms: int = 4000, scroll: bool = True) ->
                         });
                     }
                 """)
-                page.wait_for_timeout(2000)  # wait for any lazy content to render
+                page.wait_for_timeout(2500)
 
             html = page.content()
             browser.close()
@@ -140,6 +153,51 @@ def fetch_with_playwright(url: str, wait_ms: int = 4000, scroll: bool = True) ->
     except Exception as exc:
         print(f"    {Fore.YELLOW}Playwright failed for {url}: {exc}{Style.RESET_ALL}")
         return None
+
+
+def fetch_apartments_com(url: str) -> Optional[BeautifulSoup]:
+    """
+    apartments.com has aggressive bot detection. We try Playwright first,
+    then verify we actually got real content (not a bot-block page).
+    Falls back to requests with realistic headers if Playwright is blocked.
+    """
+    # Try Playwright
+    html = fetch_with_playwright(url, wait_ms=6000, scroll=True)
+    if html:
+        soup = BeautifulSoup(html, "lxml")
+        text = soup.get_text()
+        # Check we got real content — bot-block pages are tiny or missing key elements
+        if len(text) > 2000 and ("floor plan" in text.lower() or "bedroom" in text.lower() or "price" in text.lower()):
+            return soup
+        print(f"    {Fore.YELLOW}apartments.com may have blocked Playwright, trying requests...{Style.RESET_ALL}")
+
+    # Fallback: plain requests with realistic headers
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Cache-Control": "max-age=0",
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
+        if resp.status_code < 400:
+            soup = BeautifulSoup(resp.text, "lxml")
+            if len(soup.get_text()) > 2000:
+                return soup
+    except Exception:
+        pass
+
+    return None
 
 
 def fetch(url: str) -> Optional[BeautifulSoup]:
@@ -353,11 +411,13 @@ def check_pricing(website_soup, ils_soup) -> tuple[str, str, str]:
 # ── Items 5 & 6: Specials ─────────────────────────────────────────────────────
 
 SPECIAL_RE = re.compile(
+    r"move[\s\-]?in\s+special|"       # apartments.com label — check first
+    r"move-in\s+special|"
     r"\d+\s*weeks?\s+free|"
     r"\d+\s*months?\s+free|"
     r"weeks?\s+free\s+(?:base\s+)?rent|"
     r"months?\s+free\s+(?:base\s+)?rent|"
-    r"move[\s\-]?in\s+special|"
+    r"\d+\s*week\s+free|"
     r"pre[\s\-]?leasing\s+special|"
     r"leasing\s+special|"
     r"rent\s+special|"
@@ -369,7 +429,8 @@ SPECIAL_RE = re.compile(
     r"waived\s+(?:admin\s+)?fee|"
     r"\d+\s*%\s+off\s+rent|"
     r"free\s+(?:base\s+)?rent|"
-    r"special\s+offer",
+    r"special\s+offer|"
+    r"weeks?\s+free\s+on\s+select",    # "10 week free on select homes"
     re.IGNORECASE,
 )
 
@@ -467,9 +528,8 @@ def review_property(prop: dict) -> PropertyResult:
     website_html = fetch_with_playwright(prop["website"], wait_ms=5000, scroll=True)
     website_soup = BeautifulSoup(website_html, "lxml") if website_html else None
 
-    print(f"  Fetching apartments.com (Playwright + stealth)...")
-    ils_html = fetch_with_playwright(prop["apartments_com"], wait_ms=5000, scroll=True)
-    ils_soup = BeautifulSoup(ils_html, "lxml") if ils_html else None
+    print(f"  Fetching apartments.com (stealth + fallback)...")
+    ils_soup = fetch_apartments_com(prop["apartments_com"])
 
     # Item 1
     print(f"  Checking links/buttons (1.1–1.5)...")
