@@ -157,45 +157,56 @@ def fetch_with_playwright(url: str, wait_ms: int = 4000, scroll: bool = True) ->
 
 def fetch_apartments_com(url: str) -> Optional[BeautifulSoup]:
     """
-    apartments.com has aggressive bot detection. We try Playwright first,
-    then verify we actually got real content (not a bot-block page).
-    Falls back to requests with realistic headers if Playwright is blocked.
+    Fetch apartments.com using a persistent session (cookies + realistic headers).
+    Headless browsers get blocked; a plain HTTP session works like Claude.ai's fetch.
     """
-    # Try Playwright
-    html = fetch_with_playwright(url, wait_ms=6000, scroll=True)
-    if html:
-        soup = BeautifulSoup(html, "lxml")
-        text = soup.get_text()
-        # Check we got real content — bot-block pages are tiny or missing key elements
-        if len(text) > 2000 and ("floor plan" in text.lower() or "bedroom" in text.lower() or "price" in text.lower()):
-            return soup
-        print(f"    {Fore.YELLOW}apartments.com may have blocked Playwright, trying requests...{Style.RESET_ALL}")
-
-    # Fallback: plain requests with realistic headers
-    headers = {
+    session = requests.Session()
+    session.headers.update({
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0.0.0 Safari/537.36"
         ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
+        "Sec-CH-UA": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-CH-UA-Mobile": "?0",
+        "Sec-CH-UA-Platform": '"macOS"',
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
         "Cache-Control": "max-age=0",
-    }
+    })
+
     try:
-        resp = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
+        # First visit the homepage to collect cookies (mimics a real user navigation)
+        session.get("https://www.apartments.com/", timeout=15, allow_redirects=True)
+
+        # Now fetch the actual listing
+        resp = session.get(url, timeout=20, allow_redirects=True)
         if resp.status_code < 400:
             soup = BeautifulSoup(resp.text, "lxml")
-            if len(soup.get_text()) > 2000:
+            text = soup.get_text()
+            if len(text) > 2000 and any(
+                kw in text.lower() for kw in ["bedroom", "floor plan", "price", "rent", "bath"]
+            ):
                 return soup
-    except Exception:
-        pass
+            print(f"    {Fore.YELLOW}apartments.com session fetch got thin content, trying Playwright...{Style.RESET_ALL}")
+        else:
+            print(f"    {Fore.YELLOW}apartments.com returned {resp.status_code}, trying Playwright...{Style.RESET_ALL}")
+    except Exception as exc:
+        print(f"    {Fore.YELLOW}Session fetch failed: {exc}, trying Playwright...{Style.RESET_ALL}")
+
+    # Fallback: Playwright
+    html = fetch_with_playwright(url, wait_ms=6000, scroll=True)
+    if html:
+        soup = BeautifulSoup(html, "lxml")
+        if len(soup.get_text()) > 2000:
+            return soup
 
     return None
 
