@@ -1,0 +1,855 @@
+"""
+Creekside Unit Turn Automation
+==============================
+Monthly workflow:
+  1. Export "Invoice by Location" from Resman -> save as CSV
+  2. Export "Invoice by Detail" from Resman   -> save as CSV
+  3. Run:
+       python creekside_automation.py \
+           --location  invoices_by_location.csv \
+           --detail    invoices_by_detail.csv \
+           --month     2026-06 \
+           [--dry-run]
+
+Requires:
+  - GOOGLE_SERVICE_ACCOUNT_JSON env var  -> path to service account key file
+  - OR GOOGLE_CREDENTIALS_JSON           -> raw JSON string of the key
+  - Sheet must be shared with the service account email (Editor access)
+"""
+
+import os
+import re
+import sys
+import json
+import argparse
+import csv
+import io
+from datetime import datetime, date
+from collections import defaultdict
+
+# ---------------------------------------------------------------------------
+# Constants — sheet names and spreadsheet ID
+# ---------------------------------------------------------------------------
+SPREADSHEET_ID   = "1qVJ3Nz4LCgZVKlWMLP8i2xj8F0tzD6ujGDBtGhM6JhM"
+SRC_SHEET        = "DATA Invoice by Location"
+DET_SHEET        = "Invoice by Detail Report"
+UT_SHEET         = "Unit Turn Cost by Unit"
+COND_SHEET       = "Unit Conditions"
+PERQ_SHEET       = "Quarterly Turn Cost Summary"
+
+# Marketing filter keywords (same logic as AppScript)
+MARKETING_KEYWORDS = [
+    "LOCATOR COMMISSION", "LOCATOR",
+    "APARTMENT LIST", "APARTMENTLIST", "APARTMENTLIST.COM",
+    "LEAD EXPENSE", "LEADS EXPENSE",
+    "LIFT LEAD", "LIFTLEAD",
+    "MOVE-IN FEE", "MOVE IN FEE", "MOVEIN FEE",
+    "RENTERS INSURANCE", "RENTER'S INSURANCE", "RENTER INSURANCE",
+]
+
+MARKETING_REASONS = {
+    "Locator commission":          ["LOCATOR COMMISSION", "LOCATOR"],
+    "Apartment List / lead expense": ["APARTMENT LIST", "APARTMENTLIST", "APARTMENTLIST.COM"],
+    "Lead expense":                ["LEAD EXPENSE", "LEADS EXPENSE"],
+    "Lift Lead":                   ["LIFT LEAD", "LIFTLEAD"],
+    "Move-in Fee":                 ["MOVE-IN FEE", "MOVE IN FEE", "MOVEIN FEE"],
+    "Renters Insurance":           ["RENTERS INSURANCE", "RENTER'S INSURANCE", "RENTER INSURANCE"],
+}
+
+HIGH_COST_THRESHOLD = 5000   # flag units over this amount in analysis report
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def s(v):
+    return str(v or "").strip()
+
+
+def norm_unit(v):
+    digits = re.sub(r"[^0-9]", "", s(v))
+    n = int(digits) if digits else 0
+    return str(n) if 100 <= n <= 1500 else ""
+
+
+def to_date(v):
+    if isinstance(v, (date, datetime)):
+        return v if isinstance(v, datetime) else datetime(v.year, v.month, v.day)
+    raw = s(v)
+    for fmt in ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%-m/%-d/%Y", "%-m/%-d/%y"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def quarter_of(d):
+    if not d:
+        return ""
+    q = (d.month - 1) // 3 + 1
+    return f"{d.year}Q{q}"
+
+
+def norm_text(v):
+    return re.sub(r"\s+", " ", s(v)).upper()
+
+
+def norm_inv(v):
+    return s(v).upper()
+
+
+def norm_desc(v):
+    return re.sub(r"\s+", " ", s(v)).upper()
+
+
+def norm_amt(v):
+    try:
+        return round(float(re.sub(r"[^0-9.\-]", "", s(v)) or "0"), 2)
+    except ValueError:
+        return 0.0
+
+
+def build_key(unit, inv, d, desc, amt):
+    date_str = d.strftime("%Y-%m-%d") if d else ""
+    return f"{norm_unit(unit)}|{norm_inv(inv)}|{date_str}|{norm_desc(desc)}|{norm_amt(amt):.2f}"
+
+
+def is_marketing(row_texts):
+    combined = " | ".join(norm_text(v) for v in row_texts)
+    return any(kw in combined for kw in MARKETING_KEYWORDS)
+
+
+def get_marketing_reason(row_texts):
+    combined = " | ".join(norm_text(v) for v in row_texts)
+    reasons = [r for r, kws in MARKETING_REASONS.items() if any(kw in combined for kw in kws)]
+    return ", ".join(reasons)
+
+
+# ---------------------------------------------------------------------------
+# CSV loading  (handles Resman export quirks)
+# ---------------------------------------------------------------------------
+
+def load_csv(path):
+    """Return list of dicts. Tries utf-8 then latin-1."""
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            with open(path, newline="", encoding=enc) as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+                if rows:
+                    return rows
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"Cannot decode {path}")
+
+
+def _find_col(headers, *candidates):
+    """Case-insensitive column finder."""
+    upper = {h.upper(): h for h in headers}
+    for c in candidates:
+        if c.upper() in upper:
+            return upper[c.upper()]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Step 1 — Parse "Invoice by Location" CSV
+# ---------------------------------------------------------------------------
+
+def parse_location_rows(path):
+    """
+    Returns cleaned list of dicts with canonical keys:
+      unit, invoice, install_date, acctg_date, amount, gl, description, property
+    Skips marketing rows and rows with no valid unit.
+    """
+    raw = load_csv(path)
+    if not raw:
+        return [], []
+
+    headers = list(raw[0].keys())
+    col = lambda *c: _find_col(headers, *c)
+
+    c_prop  = col("PropertyName", "Property", "Property Name")
+    c_unit  = col("Unit#", "Unit #", "Unit", "ObjectName", "Object Name")
+    c_otype = col("ObjectType", "Object Type")
+    c_inv   = col("Invoice #", "Invoice#", "Invoice Number", "InvoiceNumber")
+    c_inst  = col("Install Date", "InstallDate", "Service Date")
+    c_acctg = col("Acctg Date", "AcctgDate", "Accounting Date", "AccountingDate", "Post Date")
+    c_amt   = col("Total", "Amount", "Net Amount")
+    c_gl    = col("GL Acc Number", "GL Account", "Account")
+    c_desc  = col("Description", "Memo")
+
+    kept = []
+    removed = []
+
+    for row in raw:
+        vals = list(row.values())
+        texts = [s(row.get(h, "")) for h in headers]
+
+        # Try to extract unit; fall back to description
+        raw_unit = s(row.get(c_unit, "")) if c_unit else ""
+        if not raw_unit or raw_unit.lower() == "none":
+            desc_val = s(row.get(c_desc, "")) if c_desc else ""
+            m = re.search(r"#(\d{3,4})", desc_val)
+            if m:
+                raw_unit = m.group(1)
+
+        unit = norm_unit(raw_unit)
+
+        if is_marketing(texts):
+            removed.append({
+                "unit": unit or raw_unit,
+                "invoice": norm_inv(row.get(c_inv, "")) if c_inv else "",
+                "reason": get_marketing_reason(texts),
+                "description": s(row.get(c_desc, "")) if c_desc else "",
+                "amount": norm_amt(row.get(c_amt, "")) if c_amt else 0,
+            })
+            continue
+
+        if not unit:
+            removed.append({
+                "unit": raw_unit,
+                "invoice": norm_inv(row.get(c_inv, "")) if c_inv else "",
+                "reason": "Missing / invalid unit number",
+                "description": s(row.get(c_desc, "")) if c_desc else "",
+                "amount": norm_amt(row.get(c_amt, "")) if c_amt else 0,
+            })
+            continue
+
+        kept.append({
+            "property":     s(row.get(c_prop, "Oaks at Creekside")) if c_prop else "Oaks at Creekside",
+            "unit":         unit,
+            "obj_type":     s(row.get(c_otype, "Unit")) if c_otype else "Unit",
+            "invoice":      norm_inv(row.get(c_inv, "")) if c_inv else "",
+            "install_date": to_date(row.get(c_inst, "")) if c_inst else None,
+            "acctg_date":   to_date(row.get(c_acctg, "")) if c_acctg else None,
+            "amount":       norm_amt(row.get(c_amt, "")) if c_amt else 0,
+            "gl":           s(row.get(c_gl, "")) if c_gl else "",
+            "description":  s(row.get(c_desc, "")) if c_desc else "",
+            "category":     "Unit Turn",
+        })
+
+    return kept, removed
+
+
+# ---------------------------------------------------------------------------
+# Step 2 — Parse "Invoice by Detail" CSV
+# ---------------------------------------------------------------------------
+
+def parse_detail_rows(path):
+    """
+    Returns dict: invoice_number -> invoice_date (datetime)
+    """
+    raw = load_csv(path)
+    if not raw:
+        return {}
+
+    headers = list(raw[0].keys())
+    col = lambda *c: _find_col(headers, *c)
+
+    c_inv  = col("InvoiceNumber", "Invoice Number", "Invoice #", "Invoice#")
+    c_date = col("InvoiceDate", "Invoice Date", "Date")
+
+    mapping = {}
+    for row in raw:
+        inv = norm_inv(row.get(c_inv, "")) if c_inv else ""
+        d   = to_date(row.get(c_date, "")) if c_date else None
+        if inv and inv not in mapping:
+            mapping[inv] = d
+
+    return mapping
+
+
+# ---------------------------------------------------------------------------
+# Google Sheets connection
+# ---------------------------------------------------------------------------
+
+def get_gspread_client():
+    """Authenticate via service account. Returns gspread client."""
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except ImportError:
+        print("ERROR: gspread not installed. Run:  pip install gspread google-auth")
+        sys.exit(1)
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    raw_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    json_path = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+    if raw_json:
+        info = json.loads(raw_json)
+        creds = Credentials.from_service_account_info(info, scopes=scopes)
+    elif json_path:
+        creds = Credentials.from_service_account_file(json_path, scopes=scopes)
+    else:
+        print("ERROR: Set GOOGLE_SERVICE_ACCOUNT_JSON (path) or GOOGLE_CREDENTIALS_JSON (raw JSON).")
+        sys.exit(1)
+
+    return gspread.authorize(creds)
+
+
+# ---------------------------------------------------------------------------
+# Read existing sheet data
+# ---------------------------------------------------------------------------
+
+def read_sheet_as_list(ws):
+    """Return all rows as list of lists (including header row)."""
+    return ws.get_all_values()
+
+
+def header_index(headers, *candidates):
+    """Return 0-based index of first matching header (case-insensitive)."""
+    upper = [h.strip().upper() for h in headers]
+    for c in candidates:
+        if c.upper() in upper:
+            return upper.index(c.upper())
+    return -1
+
+
+# ---------------------------------------------------------------------------
+# Update: DATA Invoice by Location
+# ---------------------------------------------------------------------------
+
+def update_src_sheet(ws, new_rows, removed_rows, dry_run=False):
+    """Append new location invoice rows; add/update Category + Removal Reason cols."""
+    all_vals = read_sheet_as_list(ws)
+    if not all_vals:
+        print(f"  [WARN] {SRC_SHEET} is empty — cannot update.")
+        return
+
+    headers = all_vals[0]
+
+    # Ensure Category and Removal Reason columns exist
+    cat_idx    = header_index(headers, "Category")
+    reason_idx = header_index(headers, "Removal Reason")
+
+    if cat_idx == -1:
+        headers.append("Category")
+        cat_idx = len(headers) - 1
+    if reason_idx == -1:
+        headers.append("Removal Reason")
+        reason_idx = len(headers) - 1
+
+    # Build existing key set to avoid duplicates
+    existing_inv = set()
+    for row in all_vals[1:]:
+        inv_val = row[3] if len(row) > 3 else ""
+        existing_inv.add(norm_inv(inv_val))
+
+    to_append = [r for r in new_rows if r["invoice"] not in existing_inv]
+
+    print(f"\n[{SRC_SHEET}]")
+    print(f"  Existing rows : {len(all_vals) - 1}")
+    print(f"  New to append : {len(to_append)}")
+    print(f"  Skipped (dupe): {len(new_rows) - len(to_append)}")
+    print(f"  Removed (mktg/no-unit): {len(removed_rows)}")
+
+    if dry_run or not to_append:
+        return
+
+    append_data = []
+    for r in to_append:
+        row_out = [""] * max(len(headers), 10)
+        row_out[0] = r["property"]
+        row_out[1] = r["unit"]
+        row_out[2] = r["obj_type"]
+        row_out[3] = r["invoice"]
+        row_out[4] = r["install_date"].strftime("%-m/%-d/%y") if r["install_date"] else ""
+        row_out[5] = r["acctg_date"].strftime("%-m/%-d/%y") if r["acctg_date"] else ""
+        row_out[6] = str(int(r["amount"])) if r["amount"] == int(r["amount"]) else str(r["amount"])
+        row_out[7] = r["gl"]
+        row_out[8] = r["description"]
+        if cat_idx < len(row_out):
+            row_out[cat_idx] = r["category"]
+        append_data.append(row_out)
+
+    ws.append_rows(append_data, value_input_option="USER_ENTERED")
+    print(f"  ✅ Appended {len(append_data)} rows.")
+
+
+# ---------------------------------------------------------------------------
+# Update: Invoice by Detail Report
+# ---------------------------------------------------------------------------
+
+def update_det_sheet(ws, detail_path, dry_run=False):
+    """Append new detail rows that don't already exist."""
+    new_raw = load_csv(detail_path)
+    all_vals = read_sheet_as_list(ws)
+
+    existing_inv = set()
+    if len(all_vals) > 1:
+        headers = all_vals[0]
+        inv_col = header_index(headers, "InvoiceNumber", "Invoice Number", "Invoice #")
+        for row in all_vals[1:]:
+            if inv_col >= 0 and inv_col < len(row):
+                existing_inv.add(norm_inv(row[inv_col]))
+
+    to_append = []
+    headers_new = list(new_raw[0].keys()) if new_raw else []
+    for row in new_raw:
+        inv = norm_inv(row.get(_find_col(headers_new, "InvoiceNumber", "Invoice Number", "Invoice #") or "", ""))
+        if inv and inv not in existing_inv:
+            to_append.append(list(row.values()))
+            existing_inv.add(inv)
+
+    print(f"\n[{DET_SHEET}]")
+    print(f"  New detail rows to append: {len(to_append)}")
+
+    if dry_run or not to_append:
+        return
+
+    ws.append_rows(to_append, value_input_option="USER_ENTERED")
+    print(f"  ✅ Appended {len(to_append)} detail rows.")
+
+
+# ---------------------------------------------------------------------------
+# Update: Unit Turn Cost by Unit
+# ---------------------------------------------------------------------------
+
+def update_unit_turn_sheet(ws, new_rows, detail_map, target_month, dry_run=False):
+    """
+    Merge new_rows filtered to target_month into Unit Turn Cost by Unit.
+    Columns: Unit | Invoice# | Invoice Date | Install Date | Description | Amount | Unit Total | Duplicate?
+    """
+    month_rows = [
+        r for r in new_rows
+        if r["acctg_date"] and
+           r["acctg_date"].year == target_month.year and
+           r["acctg_date"].month == target_month.month
+    ]
+
+    all_vals = read_sheet_as_list(ws)
+    existing_keys = set()
+    if len(all_vals) > 1:
+        for row in all_vals[1:]:
+            if len(row) >= 6:
+                key = build_key(row[0], row[1], to_date(row[3]), row[4], row[5])
+                existing_keys.add(key)
+
+    to_add = []
+    new_keys = set()
+    for r in month_rows:
+        key = build_key(r["unit"], r["invoice"], r["install_date"], r["description"], r["amount"])
+        if key not in existing_keys and key not in new_keys:
+            new_keys.add(key)
+            inv_date = detail_map.get(r["invoice"])
+            to_add.append({
+                "unit":       r["unit"],
+                "invoice":    r["invoice"],
+                "inv_date":   inv_date,
+                "inst_date":  r["install_date"],
+                "desc":       r["description"],
+                "amount":     r["amount"],
+                "key":        key,
+            })
+
+    print(f"\n[{UT_SHEET}]")
+    print(f"  Month rows found  : {len(month_rows)}")
+    print(f"  New (not in sheet): {len(to_add)}")
+
+    if dry_run or not to_add:
+        return to_add
+
+    # Combine with existing data rows
+    existing_data = all_vals[1:] if len(all_vals) > 1 else []
+
+    def row_to_dict(r):
+        return {
+            "unit":      norm_unit(r[0]) if len(r) > 0 else "",
+            "invoice":   r[1] if len(r) > 1 else "",
+            "inv_date":  to_date(r[2]) if len(r) > 2 else None,
+            "inst_date": to_date(r[3]) if len(r) > 3 else None,
+            "desc":      r[4] if len(r) > 4 else "",
+            "amount":    norm_amt(r[5]) if len(r) > 5 else 0,
+            "key":       build_key(
+                norm_unit(r[0]) if len(r) > 0 else "",
+                r[1] if len(r) > 1 else "",
+                to_date(r[3]) if len(r) > 3 else None,
+                r[4] if len(r) > 4 else "",
+                r[5] if len(r) > 5 else 0
+            ),
+            "is_new": False,
+        }
+
+    combined = [row_to_dict(r) for r in existing_data]
+    for item in to_add:
+        item["is_new"] = True
+        combined.append(item)
+
+    # Sort by unit number then install date
+    combined.sort(key=lambda r: (
+        int(r["unit"]) if r["unit"].isdigit() else 9999,
+        r["inst_date"] or datetime.min
+    ))
+
+    # Compute per-unit totals
+    unit_totals = defaultdict(float)
+    for r in combined:
+        unit_totals[r["unit"]] += float(r.get("amount", 0) or 0)
+
+    # Duplicate detection
+    key_counts = defaultdict(int)
+    for r in combined:
+        key_counts[r["key"]] += 1
+
+    # Build output rows
+    fmt_date = lambda d: d.strftime("%-m/%-d/%Y") if d else ""
+    out_rows = []
+    seen_units = set()
+    for r in combined:
+        unit_total = unit_totals[r["unit"]] if r["unit"] not in seen_units else ""
+        seen_units.add(r["unit"])
+        dup = key_counts[r["key"]] if key_counts[r["key"]] > 1 else ""
+        out_rows.append([
+            r["unit"],
+            r["invoice"],
+            fmt_date(r.get("inv_date")),
+            fmt_date(r.get("inst_date")),
+            r["desc"],
+            str(int(r["amount"])) if r.get("amount") and r["amount"] == int(r["amount"]) else str(r.get("amount", "")),
+            str(int(unit_total)) if isinstance(unit_total, float) and unit_total == int(unit_total) else str(unit_total or ""),
+            str(dup) if dup else "",
+        ])
+
+    # Write all data rows (replace rows 2 onward)
+    header_row = ["Unit", "Invoice #", "Invoice Date", "Install Date", "Description", "Amount", "Unit Total", "Duplicate?"]
+    ws.update("A1", [header_row], value_input_option="USER_ENTERED")
+
+    if out_rows:
+        # Clear existing data area first
+        last_row = max(len(all_vals), len(out_rows) + 1)
+        if last_row > 1:
+            ws.batch_clear([f"A2:H{last_row + 10}"])
+        ws.update(f"A2", out_rows, value_input_option="USER_ENTERED")
+
+    print(f"  ✅ Written {len(out_rows)} rows ({len(to_add)} new).")
+    return to_add
+
+
+# ---------------------------------------------------------------------------
+# Update: Unit Conditions — running totals
+# ---------------------------------------------------------------------------
+
+def update_unit_conditions(ws, unit_totals, dry_run=False):
+    """Write per-unit running totals into 'Total Amount Spent on Unit Turn' column."""
+    all_vals = read_sheet_as_list(ws)
+    if not all_vals:
+        return
+
+    headers = all_vals[0]
+    unit_col  = header_index(headers, "Unit")
+    total_col = header_index(headers, "Total Amount Spent on Unit Turn")
+
+    if unit_col == -1:
+        print(f"  [WARN] 'Unit' column not found in {COND_SHEET}")
+        return
+    if total_col == -1:
+        print(f"  [WARN] 'Total Amount Spent on Unit Turn' column not found in {COND_SHEET}")
+        return
+
+    updates = 0
+    batch = []
+    for i, row in enumerate(all_vals[1:], start=2):
+        u = norm_unit(row[unit_col]) if unit_col < len(row) else ""
+        if u and u in unit_totals:
+            col_letter = col_num_to_letter(total_col + 1)
+            batch.append({
+                "range": f"{col_letter}{i}",
+                "values": [[int(unit_totals[u]) if unit_totals[u] == int(unit_totals[u]) else unit_totals[u]]]
+            })
+            updates += 1
+
+    print(f"\n[{COND_SHEET}]")
+    print(f"  Units to update: {updates}")
+    if dry_run or not batch:
+        return
+
+    ws.batch_update(batch, value_input_option="USER_ENTERED")
+    print(f"  ✅ Updated {updates} unit totals.")
+
+
+# ---------------------------------------------------------------------------
+# Update: Quarterly Turn Cost Summary
+# ---------------------------------------------------------------------------
+
+def update_quarterly_summary(ws, all_ut_rows, dry_run=False):
+    """
+    Rebuild Quarterly Turn Cost Summary in-place.
+    Columns: Unit | [quarter cols] | Total | Notes
+    """
+    # Aggregate unit-quarter totals from all Unit Turn rows
+    uq_totals    = defaultdict(float)
+    unit_totals  = defaultdict(float)
+
+    for r in all_ut_rows:
+        unit  = norm_unit(r[0]) if isinstance(r, list) else r.get("unit", "")
+        inv_d = to_date(r[2]) if isinstance(r, list) else r.get("inv_date")
+        amt   = norm_amt(r[5]) if isinstance(r, list) else float(r.get("amount", 0) or 0)
+        q     = quarter_of(inv_d)
+        if unit and q:
+            uq_totals[f"{unit}|{q}"] += amt
+            unit_totals[unit] += amt
+
+    quarters = sorted(
+        {k.split("|")[1] for k in uq_totals},
+        key=lambda q: (int(q[:4]), int(q[5]))
+    )
+    units_with_data = set(unit_totals.keys())
+
+    all_vals = read_sheet_as_list(ws)
+    if not all_vals:
+        return
+
+    headers = all_vals[0]
+    unit_col  = header_index(headers, "Unit")
+    total_col = header_index(headers, "Total")
+    notes_col = header_index(headers, "Notes")
+
+    if unit_col == -1:
+        print(f"  [WARN] 'Unit' column not found in {PERQ_SHEET}")
+        return
+
+    # Map units to their existing row index
+    unit_to_row = {}
+    for i, row in enumerate(all_vals[1:], start=2):
+        u = norm_unit(row[unit_col]) if unit_col < len(row) else ""
+        if u:
+            unit_to_row[u] = i
+
+    # Ensure quarter columns exist
+    existing_quarters = {h: i for i, h in enumerate(headers) if re.match(r"^\d{4}Q[1-4]$", h)}
+
+    print(f"\n[{PERQ_SHEET}]")
+    print(f"  Quarters in data  : {quarters}")
+    print(f"  Units with amounts: {len(units_with_data)}")
+
+    if dry_run:
+        return
+
+    batch = []
+
+    for q in quarters:
+        if q not in existing_quarters:
+            # Insert column before Total
+            insert_at = total_col + 1 if total_col >= 0 else len(headers) + 1
+            ws.insert_cols([[q]], col=insert_at)
+            # Refresh after column insert
+            all_vals = read_sheet_as_list(ws)
+            headers  = all_vals[0]
+            unit_col  = header_index(headers, "Unit")
+            total_col = header_index(headers, "Total")
+            notes_col = header_index(headers, "Notes")
+            existing_quarters = {h: i for i, h in enumerate(headers) if re.match(r"^\d{4}Q[1-4]$", h)}
+            unit_to_row = {}
+            for i, row in enumerate(all_vals[1:], start=2):
+                u = norm_unit(row[unit_col]) if unit_col < len(row) else ""
+                if u:
+                    unit_to_row[u] = i
+
+    # Write per-unit quarter values and totals
+    for unit, row_i in unit_to_row.items():
+        for q, col_i in existing_quarters.items():
+            val = uq_totals.get(f"{unit}|{q}", "")
+            if val:
+                batch.append({
+                    "range": f"{col_num_to_letter(col_i + 1)}{row_i}",
+                    "values": [[int(val) if val == int(val) else val]]
+                })
+
+        if total_col >= 0:
+            tot = unit_totals.get(unit, "")
+            if tot:
+                batch.append({
+                    "range": f"{col_num_to_letter(total_col + 1)}{row_i}",
+                    "values": [[int(tot) if tot == int(tot) else tot]]
+                })
+
+    if batch:
+        ws.batch_update(batch, value_input_option="USER_ENTERED")
+
+    print(f"  ✅ Updated quarterly summary.")
+
+
+def col_num_to_letter(n):
+    """Convert 1-based column index to A, B, ..., Z, AA, ..."""
+    result = ""
+    while n:
+        n, rem = divmod(n - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Analysis Report
+# ---------------------------------------------------------------------------
+
+def print_analysis(new_rows, removed_rows, target_month, unit_totals_all):
+    """Print a formatted analysis report to stdout."""
+    bar = "=" * 60
+
+    month_label = target_month.strftime("%B %Y")
+    month_rows  = [
+        r for r in new_rows
+        if r["acctg_date"] and
+           r["acctg_date"].year == target_month.year and
+           r["acctg_date"].month == target_month.month
+    ]
+
+    # Per-unit cost this month
+    month_unit_cost = defaultdict(float)
+    for r in month_rows:
+        month_unit_cost[r["unit"]] += r["amount"]
+
+    # Duplicate invoices
+    inv_counts = defaultdict(int)
+    for r in month_rows:
+        inv_counts[r["invoice"]] += 1
+    dupes = {inv: cnt for inv, cnt in inv_counts.items() if cnt > 1}
+
+    # High-cost units (all-time)
+    high_cost = {u: t for u, t in unit_totals_all.items() if t > HIGH_COST_THRESHOLD}
+
+    print(f"\n{bar}")
+    print(f"  CREEKSIDE UNIT TURN — {month_label.upper()} ANALYSIS")
+    print(f"{bar}")
+
+    print(f"\n📋 INVOICE SUMMARY")
+    print(f"  Total new invoices processed : {len(new_rows)}")
+    print(f"  Added for {month_label:<12}    : {len(month_rows)}")
+    print(f"  Removed (marketing/no-unit)  : {len(removed_rows)}")
+    print(f"  Units active this month      : {len(month_unit_cost)}")
+
+    if month_unit_cost:
+        print(f"\n💰 COST BY UNIT — {month_label}")
+        sorted_units = sorted(month_unit_cost.items(), key=lambda x: -x[1])
+        for unit, amt in sorted_units:
+            flag = "  ⚠️  HIGH" if amt > HIGH_COST_THRESHOLD else ""
+            print(f"  Unit {unit:<6}  ${amt:>8,.0f}{flag}")
+        print(f"  {'TOTAL':<10}  ${sum(month_unit_cost.values()):>8,.0f}")
+
+    if dupes:
+        print(f"\n🔁 DUPLICATE INVOICE FLAGS")
+        for inv, cnt in dupes.items():
+            print(f"  Invoice {inv} appears {cnt}x — please verify")
+
+    if high_cost:
+        print(f"\n🚨 HIGH-COST UNITS (All-Time > ${HIGH_COST_THRESHOLD:,})")
+        for unit, tot in sorted(high_cost.items(), key=lambda x: -x[1]):
+            print(f"  Unit {unit:<6}  ${tot:>8,.0f} cumulative")
+
+    if removed_rows:
+        print(f"\n🗑️  REMOVED ROWS ({len(removed_rows)} total)")
+        mktg = [r for r in removed_rows if r["reason"] != "Missing / invalid unit number"]
+        no_unit = [r for r in removed_rows if r["reason"] == "Missing / invalid unit number"]
+        if mktg:
+            print(f"  Marketing/non-turn ({len(mktg)}):")
+            for r in mktg:
+                print(f"    Unit {r['unit'] or '???'} | {r['invoice']} | {r['reason']}")
+        if no_unit:
+            print(f"  Missing unit # ({len(no_unit)}):")
+            for r in no_unit:
+                print(f"    Invoice {r['invoice']} | {r['description'][:50]}")
+
+    print(f"\n{bar}\n")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Creekside Unit Turn — Monthly automation (processes CSVs → updates Google Sheet)"
+    )
+    parser.add_argument("--location", required=True,
+                        help="Path to Invoice by Location CSV export from Resman")
+    parser.add_argument("--detail",   required=True,
+                        help="Path to Invoice by Detail CSV export from Resman")
+    parser.add_argument("--month",    required=True,
+                        help="Target month in YYYY-MM format (e.g. 2026-06)")
+    parser.add_argument("--dry-run",  action="store_true",
+                        help="Parse and report without writing to the sheet")
+    parser.add_argument("--threshold", type=float, default=HIGH_COST_THRESHOLD,
+                        help=f"High-cost alert threshold (default: ${HIGH_COST_THRESHOLD:,})")
+    args = parser.parse_args()
+
+    global HIGH_COST_THRESHOLD
+    HIGH_COST_THRESHOLD = args.threshold
+
+    try:
+        target_month = datetime.strptime(args.month, "%Y-%m")
+    except ValueError:
+        print("ERROR: --month must be in YYYY-MM format, e.g. 2026-06")
+        sys.exit(1)
+
+    print(f"\nCreekside Unit Turn Automation")
+    print(f"Target month : {target_month.strftime('%B %Y')}")
+    print(f"Dry run      : {args.dry_run}")
+    print(f"Location CSV : {args.location}")
+    print(f"Detail CSV   : {args.detail}")
+
+    # --- Parse inputs ---
+    print("\n[Parsing CSVs...]")
+    new_rows, removed_rows = parse_location_rows(args.location)
+    detail_map = parse_detail_rows(args.detail)
+    print(f"  Location rows (clean): {len(new_rows)}")
+    print(f"  Location rows (removed): {len(removed_rows)}")
+    print(f"  Detail invoice map: {len(detail_map)} entries")
+
+    if args.dry_run:
+        # Build unit totals from new rows only for report
+        unit_totals_all = defaultdict(float)
+        for r in new_rows:
+            unit_totals_all[r["unit"]] += r["amount"]
+        print_analysis(new_rows, removed_rows, target_month, unit_totals_all)
+        print("(Dry run — no sheet changes made.)")
+        return
+
+    # --- Connect to sheet ---
+    print("\n[Connecting to Google Sheets...]")
+    gc = get_gspread_client()
+    wb = gc.open_by_key(SPREADSHEET_ID)
+
+    ws_src  = wb.worksheet(SRC_SHEET)
+    ws_det  = wb.worksheet(DET_SHEET)
+    ws_ut   = wb.worksheet(UT_SHEET)
+    ws_cond = wb.worksheet(COND_SHEET)
+    ws_perq = wb.worksheet(PERQ_SHEET)
+    print("  ✅ Connected.")
+
+    # --- Step 1: Update DATA Invoice by Location ---
+    update_src_sheet(ws_src, new_rows, removed_rows, dry_run=False)
+
+    # --- Step 2: Update Invoice by Detail ---
+    update_det_sheet(ws_det, args.detail, dry_run=False)
+
+    # --- Step 3: Update Unit Turn Cost by Unit ---
+    update_unit_turn_sheet(ws_ut, new_rows, detail_map, target_month, dry_run=False)
+
+    # --- Step 4: Compute all-time unit totals for downstream steps ---
+    ut_all_vals = read_sheet_as_list(ws_ut)
+    unit_totals_all = defaultdict(float)
+    for row in ut_all_vals[1:]:
+        u   = norm_unit(row[0]) if len(row) > 0 else ""
+        amt = norm_amt(row[5]) if len(row) > 5 else 0
+        if u:
+            unit_totals_all[u] += amt
+
+    # --- Step 5: Update Unit Conditions ---
+    update_unit_conditions(ws_cond, unit_totals_all, dry_run=False)
+
+    # --- Step 6: Update Quarterly Turn Cost Summary ---
+    update_quarterly_summary(ws_perq, ut_all_vals[1:], dry_run=False)
+
+    # --- Analysis Report ---
+    print_analysis(new_rows, removed_rows, target_month, unit_totals_all)
+
+
+if __name__ == "__main__":
+    main()
