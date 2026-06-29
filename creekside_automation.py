@@ -24,6 +24,7 @@ import json
 import argparse
 import csv
 import io
+import time
 from datetime import datetime, date
 from collections import defaultdict
 
@@ -110,9 +111,9 @@ def norm_amt(v):
         return 0.0
 
 
-def build_key(unit, inv, d, desc, amt):
-    date_str = d.strftime("%Y-%m-%d") if d else ""
-    return f"{norm_unit(unit)}|{norm_inv(inv)}|{date_str}|{norm_desc(desc)}|{norm_amt(amt):.2f}"
+def build_key(unit, inv, desc):
+    """Dedup key: unit|invoice|description (no amount — sheet displays truncated values)."""
+    return f"{norm_unit(unit)}|{norm_inv(inv)}|{norm_desc(desc)}"
 
 
 def is_marketing(row_texts):
@@ -412,7 +413,7 @@ def update_det_sheet(ws, detail_path, dry_run=False):
 # Update: Unit Turn Cost by Unit
 # ---------------------------------------------------------------------------
 
-def update_unit_turn_sheet(ws, new_rows, detail_map, target_month, dry_run=False):
+def update_unit_turn_sheet(ws, new_rows, detail_map, target_month, wb_gs=None, dry_run=False):
     """
     Merge new_rows filtered to target_month into Unit Turn Cost by Unit.
     Columns: Unit | Invoice# | Invoice Date | Install Date | Description | Amount | Unit Total | Duplicate?
@@ -428,14 +429,14 @@ def update_unit_turn_sheet(ws, new_rows, detail_map, target_month, dry_run=False
     existing_keys = set()
     if len(all_vals) > 1:
         for row in all_vals[1:]:
-            if len(row) >= 6:
-                key = build_key(row[0], row[1], to_date(row[3]), row[4], row[5])
+            if len(row) >= 5:
+                key = build_key(row[0], row[1], row[4])
                 existing_keys.add(key)
 
     to_add = []
     new_keys = set()
     for r in month_rows:
-        key = build_key(r["unit"], r["invoice"], r["install_date"], r["description"], r["amount"])
+        key = build_key(r["unit"], r["invoice"], r["description"])
         if key not in existing_keys and key not in new_keys:
             new_keys.add(key)
             inv_date = detail_map.get(r["invoice"])
@@ -470,9 +471,7 @@ def update_unit_turn_sheet(ws, new_rows, detail_map, target_month, dry_run=False
             "key":       build_key(
                 norm_unit(r[0]) if len(r) > 0 else "",
                 r[1] if len(r) > 1 else "",
-                to_date(r[3]) if len(r) > 3 else None,
                 r[4] if len(r) > 4 else "",
-                r[5] if len(r) > 5 else 0
             ),
             "is_new": False,
         }
@@ -526,10 +525,129 @@ def update_unit_turn_sheet(ws, new_rows, detail_map, target_month, dry_run=False
         last_row = max(len(all_vals), len(out_rows) + 1)
         if last_row > 1:
             ws.batch_clear([f"A2:H{last_row + 10}"])
-        ws.update(f"A2", out_rows, value_input_option="USER_ENTERED")
+        ws.update("A2", out_rows, value_input_option="USER_ENTERED")
 
+    time.sleep(2)
     print(f"  ✅ Written {len(out_rows)} rows ({len(to_add)} new).")
+
+    # Apply formatting: pastel banding per unit + red font for new month rows
+    _apply_ut_formatting(ws, wb_gs=wb_gs or ws.spreadsheet, out_rows=out_rows, new_month_keys={
+        build_key(r["unit"], r["invoice"], r["description"]) for r in to_add
+    })
+
     return to_add
+
+
+PASTEL_COLORS = [
+    {"red": 0.957, "green": 0.800, "blue": 0.800},  # #f4cccc
+    {"red": 0.988, "green": 0.898, "blue": 0.804},  # #fce5cd
+    {"red": 1.000, "green": 0.949, "blue": 0.800},  # #fff2cc
+    {"red": 0.851, "green": 0.918, "blue": 0.827},  # #d9ead3
+    {"red": 0.816, "green": 0.878, "blue": 0.890},  # #d0e0e3
+    {"red": 0.812, "green": 0.886, "blue": 0.953},  # #cfe2f3
+    {"red": 0.851, "green": 0.824, "blue": 0.914},  # #d9d2e9
+    {"red": 0.918, "green": 0.820, "blue": 0.863},  # #ead1dc
+]
+
+
+def _apply_ut_formatting(ws, wb_gs, out_rows, new_month_keys):
+    """Apply pastel background per unit group + red font for new month rows."""
+    import time as _time
+    sid = ws.id
+    requests = []
+
+    # Clear all formatting in data rows first
+    requests.append({
+        "repeatCell": {
+            "range": {
+                "sheetId": sid,
+                "startRowIndex": 1,
+                "endRowIndex": len(out_rows) + 2,
+                "startColumnIndex": 0,
+                "endColumnIndex": 8,
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "backgroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0},
+                    "textFormat": {"foregroundColor": {"red": 0, "green": 0, "blue": 0}, "bold": False},
+                }
+            },
+            "fields": "userEnteredFormat(backgroundColor,textFormat)",
+        }
+    })
+
+    # Assign pastel color per unique unit (order of first appearance)
+    seen_units = []
+    seen_set = set()
+    for row in out_rows:
+        u = row[0]
+        if u not in seen_set:
+            seen_set.add(u)
+            seen_units.append(u)
+    unit_color = {u: PASTEL_COLORS[i % len(PASTEL_COLORS)] for i, u in enumerate(seen_units)}
+
+    # Build pastel background requests (group consecutive rows of same unit)
+    current_unit = None
+    group_start = None
+    for i, row in enumerate(out_rows):
+        u = row[0]
+        if u != current_unit:
+            if current_unit is not None and group_start is not None:
+                requests.append({
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sid,
+                            "startRowIndex": group_start + 1,
+                            "endRowIndex": i + 1,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": 8,
+                        },
+                        "cell": {"userEnteredFormat": {"backgroundColor": unit_color.get(current_unit, {"red": 1, "green": 1, "blue": 1})}},
+                        "fields": "userEnteredFormat.backgroundColor",
+                    }
+                })
+            current_unit = u
+            group_start = i
+    if current_unit is not None and group_start is not None:
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sid,
+                    "startRowIndex": group_start + 1,
+                    "endRowIndex": len(out_rows) + 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 8,
+                },
+                "cell": {"userEnteredFormat": {"backgroundColor": unit_color.get(current_unit, {"red": 1, "green": 1, "blue": 1})}},
+                "fields": "userEnteredFormat.backgroundColor",
+            }
+        })
+
+    # Red font for new month rows (no background change, just font color)
+    red = {"red": 1.0, "green": 0.0, "blue": 0.0}
+    for i, row in enumerate(out_rows):
+        k = build_key(row[0], row[1], row[4])
+        if k in new_month_keys:
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sid,
+                        "startRowIndex": i + 1,
+                        "endRowIndex": i + 2,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": 8,
+                    },
+                    "cell": {"userEnteredFormat": {"textFormat": {"foregroundColor": red}}},
+                    "fields": "userEnteredFormat.textFormat.foregroundColor",
+                }
+            })
+
+    # Send in chunks
+    CHUNK = 50
+    for start in range(0, len(requests), CHUNK):
+        wb_gs.batch_update({"requests": requests[start:start + CHUNK]})
+        _time.sleep(2)
+    print(f"  ✅ Formatting applied ({len(new_month_keys)} rows in red font).")
 
 
 # ---------------------------------------------------------------------------
@@ -830,7 +948,7 @@ def main():
     update_det_sheet(ws_det, args.detail, dry_run=False)
 
     # --- Step 3: Update Unit Turn Cost by Unit ---
-    update_unit_turn_sheet(ws_ut, new_rows, detail_map, target_month, dry_run=False)
+    update_unit_turn_sheet(ws_ut, new_rows, detail_map, target_month, wb_gs=wb, dry_run=False)
 
     # --- Step 4: Compute all-time unit totals for downstream steps ---
     ut_all_vals = read_sheet_as_list(ws_ut)
