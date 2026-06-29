@@ -5,3 +5,5 @@ openpyxl
 colorama
 python-dotenv
 lxml
+pdfplumber
+python-docx
