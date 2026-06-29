@@ -882,6 +882,7 @@ def print_analysis(new_rows, removed_rows, target_month, unit_totals_all):
 # ---------------------------------------------------------------------------
 
 def main():
+    global HIGH_COST_THRESHOLD
     parser = argparse.ArgumentParser(
         description="Creekside Unit Turn — Monthly automation (processes CSVs → updates Google Sheet)"
     )
@@ -897,7 +898,6 @@ def main():
                         help=f"High-cost alert threshold (default: ${HIGH_COST_THRESHOLD:,})")
     args = parser.parse_args()
 
-    global HIGH_COST_THRESHOLD
     HIGH_COST_THRESHOLD = args.threshold
 
     try:
@@ -964,6 +964,14 @@ def main():
 
     # --- Step 6: Update Quarterly Turn Cost Summary ---
     update_quarterly_summary(ws_perq, ut_all_vals[1:], dry_run=False)
+
+    # --- Step 7: Rebuild Analysis tab ---
+    try:
+        from build_analysis_tab import main as build_analysis
+        build_analysis()
+        print("\n✅ Analysis tab updated.")
+    except Exception as e:
+        print(f"\n[WARN] Analysis tab not updated: {e}")
 
     # --- Analysis Report ---
     print_analysis(new_rows, removed_rows, target_month, unit_totals_all)
