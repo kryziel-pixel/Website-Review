@@ -807,6 +807,100 @@ def col_num_to_letter(n):
 # Analysis Report
 # ---------------------------------------------------------------------------
 
+def crosscheck_meeting_notes_vs_invoices(gc, target_month):
+    """
+    Step 8: Compare Unit Conditions meeting notes against actual invoices for target_month.
+    Prints a reconciliation report:
+      ✅  unit discussed in notes AND has invoices this month
+      ⚠️  unit discussed in notes BUT no invoice this month
+      🔍  unit has invoices this month BUT was never mentioned in notes
+    """
+    print("\n[Cross-Check: Meeting Notes vs Invoices]")
+    month_label = target_month.strftime("%B %Y")
+    month_tag   = target_month.strftime("%-m/%-d/%y")   # e.g. "6/24/26"
+    month_tag_alt = target_month.strftime("%m/%Y")        # "06/2026"
+
+    try:
+        wb = gc.open_by_key(SPREADSHEET_ID)
+        ws_cond = wb.worksheet(COND_SHEET)
+        ws_ut   = wb.worksheet(UT_SHEET)
+    except Exception as e:
+        print(f"  [WARN] Could not open sheets for cross-check: {e}")
+        return
+
+    # --- Units mentioned in Unit Conditions notes (any entry for target month) ---
+    cond_vals = ws_cond.get_all_values()
+    if not cond_vals:
+        print("  [WARN] Unit Conditions sheet is empty.")
+        return
+
+    headers   = cond_vals[0]
+    unit_col  = next((i for i, h in enumerate(headers) if "unit" in h.lower()), 0)
+    issue_col = next((i for i, h in enumerate(headers) if "condition" in h.lower() or "issue" in h.lower()), 3)
+
+    month_str      = target_month.strftime("%-m/%Y")   # "6/2026"
+    month_yr_short = target_month.strftime("%-m/%-d")  # "6/" prefix for any day
+
+    discussed_units = set()
+    for row in cond_vals[1:]:
+        unit = norm_unit(row[unit_col]) if unit_col < len(row) else ""
+        if not unit:
+            continue
+        notes = row[issue_col] if issue_col < len(row) else ""
+        # Check if the notes contain any date entry for the target month/year
+        if notes and (
+            target_month.strftime("%-m/") in notes and str(target_month.year)[-2:] in notes
+        ):
+            discussed_units.add(unit)
+
+    # --- Units with actual invoices this month ---
+    ut_vals = ws_ut.get_all_values()
+    invoiced_units = set()
+    target_yr  = target_month.year
+    target_mon = target_month.month
+    for row in ut_vals[1:]:
+        unit = norm_unit(row[0]) if len(row) > 0 else ""
+        if not unit:
+            continue
+        # Install date in col D (index 3)
+        raw_date = row[3] if len(row) > 3 else ""
+        d = None
+        for fmt in ("%m/%d/%Y", "%m/%d/%y", "%-m/%-d/%Y", "%-m/%-d/%y", "%Y-%m-%d"):
+            try:
+                d = datetime.strptime(raw_date, fmt)
+                break
+            except ValueError:
+                continue
+        if d and d.year == target_yr and d.month == target_mon:
+            invoiced_units.add(unit)
+
+    both        = discussed_units & invoiced_units
+    notes_only  = discussed_units - invoiced_units
+    invoice_only = invoiced_units - discussed_units
+
+    print(f"  Month: {month_label}")
+    print(f"  Units in meeting notes this month : {len(discussed_units)}")
+    print(f"  Units with invoices this month    : {len(invoiced_units)}")
+
+    if both:
+        print(f"\n  ✅ Discussed in notes AND invoiced ({len(both)}):")
+        for u in sorted(both, key=lambda x: int(x)):
+            print(f"     Unit {u}")
+
+    if notes_only:
+        print(f"\n  ⚠️  In meeting notes but NO invoice received ({len(notes_only)}):")
+        for u in sorted(notes_only, key=lambda x: int(x)):
+            print(f"     Unit {u}  ← follow up: was work ordered / vendor paid?")
+
+    if invoice_only:
+        print(f"\n  🔍 Invoice received but NOT in meeting notes ({len(invoice_only)}):")
+        for u in sorted(invoice_only, key=lambda x: int(x)):
+            print(f"     Unit {u}  ← verify this was intentional / not a billing error")
+
+    if not discussed_units and not invoiced_units:
+        print("  No data found for cross-check — check sheet content and date format.")
+
+
 def print_analysis(new_rows, removed_rows, target_month, unit_totals_all):
     """Print a formatted analysis report to stdout."""
     bar = "=" * 60
@@ -972,6 +1066,9 @@ def main():
         print("\n✅ Analysis tab updated.")
     except Exception as e:
         print(f"\n[WARN] Analysis tab not updated: {e}")
+
+    # --- Step 8: Cross-check meeting notes vs invoices ---
+    crosscheck_meeting_notes_vs_invoices(gc, target_month)
 
     # --- Analysis Report ---
     print_analysis(new_rows, removed_rows, target_month, unit_totals_all)
