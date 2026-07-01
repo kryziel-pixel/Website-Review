@@ -290,7 +290,17 @@ def run_from_email_body(email_body, meeting_date_label, dry_run=False):
         print("No unit notes found in email — check parsing.")
         return {}
 
-    return update_sheet(unit_notes, meeting_date_label, dry_run=dry_run)
+    result = update_sheet(unit_notes, meeting_date_label, dry_run=dry_run)
+
+    if not dry_run and (result.get("updated") or result.get("created")):
+        try:
+            from build_dashboard import main as build_dashboard
+            print("\nRebuilding dashboard with updated notes…")
+            build_dashboard()
+        except Exception as e:
+            print(f"[WARN] Dashboard not rebuilt: {e}")
+
+    return result
 
 
 def main():

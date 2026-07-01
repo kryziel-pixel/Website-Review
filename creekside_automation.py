@@ -1070,6 +1070,14 @@ def main():
     # --- Step 8: Cross-check meeting notes vs invoices ---
     crosscheck_meeting_notes_vs_invoices(gc, target_month)
 
+    # --- Step 9: Rebuild interactive dashboard ---
+    try:
+        from build_dashboard import main as build_dashboard
+        build_dashboard()
+        print("\n✅ Dashboard rebuilt.")
+    except Exception as e:
+        print(f"\n[WARN] Dashboard not rebuilt: {e}")
+
     # --- Analysis Report ---
     print_analysis(new_rows, removed_rows, target_month, unit_totals_all)
 
