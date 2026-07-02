@@ -891,6 +891,185 @@ MAJOR_TURN_PHRASES = [
 EASY_TURN_THRESHOLD  = 1500   # spending over this on an "easy turn" is a flag
 WATCH_TURN_THRESHOLD = 3000   # spending over this on a "watch" unit is a flag
 
+# Post-premium/renovation: flag if this much NEW spend accumulates after the note was written
+POST_PREMIUM_THRESHOLD = 2000
+
+# Durable work: category -> minimum months before it should be billed again
+DURABLE_WORK_MIN_MONTHS = {
+    "Flooring":           24,   # carpet/plank/LVP should last 2+ years
+    "Resurfacing":        24,   # tub resurface should last 2+ years
+    "Cabinets/Counters":  36,   # cabinets/countertops should last 3+ years
+    "HVAC":               36,
+    "Appliances":         36,
+    "Electrical":         36,
+    "Doors":              24,
+    "Structural/Exterior": 36,
+}
+
+# Keywords that identify a unit as Premium or Renovated in Quarterly notes
+PREMIUM_KEYWORDS = ["premium", "renovated", "renovation", "upgraded", "upgrade"]
+SPECIAL_CIRCUMSTANCE_KEYWORDS = [
+    "biohazard", "storm", "flood", "fire", "medical", "legal",
+    "mold remediation", "insurance", "emergency",
+]
+
+
+def _read_quarterly_notes(wb):
+    """
+    Read 'Notes by Kryziel' column from Quarterly Turn Cost Summary.
+    Returns dict: unit -> note_text (lowercase).
+    """
+    try:
+        ws   = wb.worksheet(PERQ_SHEET)
+        vals = ws.get_all_values()
+    except Exception:
+        return {}
+    if not vals:
+        return {}
+    headers = [h.strip().lower() for h in vals[0]]
+    unit_col  = next((i for i, h in enumerate(headers) if h == "unit"), 0)
+    notes_col = next((i for i, h in enumerate(headers) if "notes by" in h), -1)
+    if notes_col == -1:
+        notes_col = next((i for i, h in enumerate(headers) if "notes" in h), -1)
+    if notes_col == -1:
+        return {}
+    result = {}
+    for row in vals[1:]:
+        unit = norm_unit(row[unit_col]) if unit_col < len(row) else ""
+        note = row[notes_col].strip() if notes_col < len(row) else ""
+        if unit and note:
+            result[unit] = note
+    return result
+
+
+def _classify_quarterly_note(note_text):
+    """
+    Returns tuple: (is_premium, is_special_circumstance, raw_note)
+    based on keywords in the Quarterly notes.
+    """
+    lower = note_text.lower()
+    is_premium = any(kw in lower for kw in PREMIUM_KEYWORDS)
+    is_special = any(kw in lower for kw in SPECIAL_CIRCUMSTANCE_KEYWORDS)
+    return is_premium, is_special
+
+
+def _detect_repeat_durable_work(unit, all_ut_rows, target_month, inv_cat_map):
+    """
+    For a given unit, check if any durable-category work billed this month
+    was also billed within the minimum lookback window.
+    Returns list of flag strings.
+    """
+    target_yr  = target_month.year
+    target_mon = target_month.month
+
+    # Collect all invoices for this unit with dates and categories
+    unit_history = []  # list of (date, category, desc, amount)
+    for row in all_ut_rows:
+        u = norm_unit(row[0]) if len(row) > 0 else ""
+        if u != unit:
+            continue
+        inv_num = row[1].strip() if len(row) > 1 else ""
+        raw_d   = row[3] if len(row) > 3 else ""
+        desc    = row[4].strip() if len(row) > 4 else ""
+        amt     = norm_amt(row[5]) if len(row) > 5 else 0
+        cat     = inv_cat_map.get(inv_num.upper(), "Other")
+        d = None
+        for fmt in ("%m/%d/%Y", "%m/%d/%y", "%-m/%-d/%Y", "%-m/%-d/%y", "%Y-%m-%d"):
+            try:
+                d = datetime.strptime(raw_d, fmt)
+                break
+            except ValueError:
+                continue
+        if d:
+            unit_history.append((d, cat, desc, amt))
+
+    # Separate this month vs prior history
+    this_month_cats = {}  # category -> (date, desc, amt)
+    prior_history   = []  # (date, cat, desc, amt)
+    for d, cat, desc, amt in unit_history:
+        if d.year == target_yr and d.month == target_mon:
+            if cat not in this_month_cats:
+                this_month_cats[cat] = (d, desc, amt)
+        else:
+            prior_history.append((d, cat, desc, amt))
+
+    flags = []
+    for cat, min_months in DURABLE_WORK_MIN_MONTHS.items():
+        if cat not in this_month_cats:
+            continue
+        this_d, this_desc, this_amt = this_month_cats[cat]
+        # Find most recent prior invoice in same category
+        prior_same = [(d, desc, amt) for d, c, desc, amt in prior_history if c == cat]
+        if not prior_same:
+            continue
+        prior_same.sort(key=lambda x: x[0], reverse=True)
+        last_d, last_desc, last_amt = prior_same[0]
+        months_gap = (this_d.year - last_d.year) * 12 + (this_d.month - last_d.month)
+        if months_gap < min_months:
+            flags.append(
+                f"Repeat {cat} within {months_gap}mo (min expected gap: {min_months}mo) — "
+                f"prior: {last_d.strftime('%-m/%Y')} ({_fmt_amt(last_amt)} · {last_desc[:40]})"
+            )
+    return flags
+
+
+def _detect_premium_cost_creep(unit, quarterly_note, all_ut_rows, target_month, inv_cat_map):
+    """
+    For Premium/Renovated units: calculate total spend AFTER the note was written.
+    Flags if post-premium spend is creeping up significantly.
+    Returns (context_label, creep_flags).
+    """
+    is_premium, is_special = _classify_quarterly_note(quarterly_note)
+    if not is_premium:
+        return None, []
+
+    label = "Premium" if "premium" in quarterly_note.lower() else "Renovated"
+
+    # Rough heuristic: assume the premium renovation happened in the quarter with
+    # the highest single-quarter spend. Post-premium = everything after that quarter.
+    unit_by_quarter = defaultdict(float)
+    unit_by_quarter_d = {}
+    for row in all_ut_rows:
+        u = norm_unit(row[0]) if len(row) > 0 else ""
+        if u != unit:
+            continue
+        raw_d = row[3] if len(row) > 3 else ""
+        amt   = norm_amt(row[5]) if len(row) > 5 else 0
+        d = None
+        for fmt in ("%m/%d/%Y", "%m/%d/%y", "%-m/%-d/%Y", "%-m/%-d/%y", "%Y-%m-%d"):
+            try:
+                d = datetime.strptime(raw_d, fmt)
+                break
+            except ValueError:
+                continue
+        if d:
+            q = f"{d.year}Q{(d.month-1)//3+1}"
+            unit_by_quarter[q] += amt
+            if q not in unit_by_quarter_d or d < unit_by_quarter_d[q]:
+                unit_by_quarter_d[q] = d
+
+    if not unit_by_quarter:
+        return label, []
+
+    # Quarter with highest spend = likely the premium renovation quarter
+    peak_quarter = max(unit_by_quarter, key=lambda q: unit_by_quarter[q])
+    peak_d = unit_by_quarter_d.get(peak_quarter)
+
+    # Sum spend in all quarters AFTER the peak quarter
+    post_spend = 0.0
+    for q, amt in unit_by_quarter.items():
+        if q > peak_quarter:
+            post_spend += amt
+
+    creep_flags = []
+    if post_spend >= POST_PREMIUM_THRESHOLD:
+        creep_flags.append(
+            f"{label} unit — post-renovation spend is {_fmt_amt(post_spend)} "
+            f"(since {peak_quarter}). Monitor for ongoing cost creep."
+        )
+
+    return label, creep_flags
+
 
 def _extract_month_notes(notes_text, target_month):
     """Extract only the note entries for target_month from the full notes string."""
@@ -1015,51 +1194,69 @@ def crosscheck_meeting_notes_vs_invoices(gc, target_month):
 
     invoiced_units = set(unit_invoices.keys())
 
+    # ── Read Quarterly notes (your context notes per unit) ──────────
+    quarterly_notes = _read_quarterly_notes(wb)   # unit -> "Premium", "Renovated", etc.
+    all_ut_rows = ut_vals[1:]
+
     # ── Analyse each unit ───────────────────────────────────────────
-    findings = []   # list of dicts for sheet output
+    findings = []
 
     all_units = sorted(set(list(discussed_units.keys()) + list(invoiced_units)),
                        key=lambda x: int(x) if x.isdigit() else 9999)
 
-    flags_summary = {"clean": [], "no_invoice": [], "unmentioned": [],
-                     "easy_overspend": [], "scope_creep": [], "unexpected_cat": []}
+    flags_summary = {
+        "clean": [], "no_invoice": [], "unmentioned": [],
+        "easy_overspend": [], "scope_creep": [], "unexpected_cat": [],
+        "repeat_durable": [], "premium_creep": [],
+    }
 
     for unit in all_units:
-        in_notes   = unit in discussed_units
-        in_invoice = unit in invoiced_units
-        notes_text = discussed_units.get(unit, "")
-        invoices   = unit_invoices.get(unit, [])
+        in_notes    = unit in discussed_units
+        in_invoice  = unit in invoiced_units
+        notes_text  = discussed_units.get(unit, "")
+        invoices    = unit_invoices.get(unit, [])
         total_spend = sum(i["amount"] for i in invoices)
         actual_cats = set(i["category"] for i in invoices)
+        q_note      = quarterly_notes.get(unit, "")
 
-        # Expected categories from notes keywords
         expected_cats = _detect_expected_categories(notes_text) if notes_text else set()
         scope_claim   = _detect_scope_claim(notes_text) if notes_text else None
+
+        # Classify quarterly context note
+        is_premium, is_special = _classify_quarterly_note(q_note) if q_note else (False, False)
+        premium_label, creep_flags = _detect_premium_cost_creep(
+            unit, q_note, all_ut_rows, target_month, inv_cat_map
+        ) if q_note else (None, [])
+
+        # Repeat durable work check (all-time history)
+        repeat_flags = _detect_repeat_durable_work(
+            unit, all_ut_rows, target_month, inv_cat_map
+        ) if in_invoice else []
 
         flags = []
 
         if in_notes and in_invoice:
             status = "✅ Match"
 
-            # Flag: easy turn but high spend
+            # Easy turn but high spend
             if scope_claim == "easy" and total_spend > EASY_TURN_THRESHOLD:
                 flags.append(f"Easy turn claimed but spent {_fmt_amt(total_spend)}")
                 flags_summary["easy_overspend"].append(unit)
 
-            # Flag: unexpected categories (invoiced but not mentioned in notes)
+            # Unexpected categories billed
             if expected_cats:
                 unexpected = actual_cats - expected_cats - {"Other", "Make Ready", "Cleaning"}
                 if unexpected:
                     flags.append(f"Unexpected work billed: {', '.join(sorted(unexpected))}")
                     flags_summary["unexpected_cat"].append(unit)
 
-            # Flag: expected categories missing from invoices
+            # Expected work with no invoice
             missing_cats = expected_cats - actual_cats
             if missing_cats:
                 flags.append(f"Expected but no invoice for: {', '.join(sorted(missing_cats))}")
                 flags_summary["scope_creep"].append(unit)
 
-            if not flags:
+            if not flags and not repeat_flags and not creep_flags:
                 flags_summary["clean"].append(unit)
 
         elif in_notes and not in_invoice:
@@ -1072,21 +1269,36 @@ def crosscheck_meeting_notes_vs_invoices(gc, target_month):
             flags.append("Invoice received but unit never mentioned in meeting notes")
             flags_summary["unmentioned"].append(unit)
 
-        # Build description list
+        # Repeat durable work flags (apply regardless of match status)
+        if repeat_flags:
+            flags.extend(repeat_flags)
+            flags_summary["repeat_durable"].append(unit)
+
+        # Premium/Renovated cost creep flags
+        if creep_flags:
+            flags.extend(creep_flags)
+            flags_summary["premium_creep"].append(unit)
+
+        # Context label from your quarterly notes
+        context_label = premium_label or ("Special circumstance" if is_special else "—")
+        if q_note and not premium_label and not is_special:
+            context_label = q_note[:60]
+
         inv_desc = "; ".join(
             f"{i['category']} {_fmt_amt(i['amount'])}" for i in
             sorted(invoices, key=lambda x: -x["amount"])
         ) if invoices else "—"
 
         findings.append({
-            "unit":          unit,
-            "status":        status,
-            "scope_claim":   scope_claim or "—",
-            "notes_summary": notes_text[:200] if notes_text else "—",
-            "expected_work": ", ".join(sorted(expected_cats)) if expected_cats else "—",
+            "unit":           unit,
+            "status":         status,
+            "context":        context_label,
+            "scope_claim":    scope_claim or "—",
+            "notes_summary":  notes_text[:200] if notes_text else "—",
+            "expected_work":  ", ".join(sorted(expected_cats)) if expected_cats else "—",
             "actual_invoices": inv_desc,
-            "total_spend":   _fmt_amt(total_spend) if total_spend else "—",
-            "flags":         " | ".join(flags) if flags else "OK",
+            "total_spend":    _fmt_amt(total_spend) if total_spend else "—",
+            "flags":          " | ".join(flags) if flags else "OK",
         })
 
     # ── Write to Cross-Check sheet tab ─────────────────────────────
@@ -1095,28 +1307,28 @@ def crosscheck_meeting_notes_vs_invoices(gc, target_month):
             ws_cc = wb.worksheet("Cross-Check")
             ws_cc.clear()
         except Exception:
-            ws_cc = wb.add_worksheet("Cross-Check", rows=500, cols=10)
+            ws_cc = wb.add_worksheet("Cross-Check", rows=500, cols=12)
 
         header_row = [
-            "Unit", "Status", "Scope Claim", "Notes Summary (this month)",
-            "Expected Work (from notes)", "Actual Invoices Billed",
-            "Total Spend", f"Flags — {month_label}",
+            "Unit", "Status", "Your Context Note", "Scope Claim",
+            "Notes Summary (this month)", "Expected Work (from notes)",
+            "Actual Invoices Billed", "Total Spend", f"Flags — {month_label}",
         ]
         out_rows = [header_row] + [[
-            f["unit"], f["status"], f["scope_claim"], f["notes_summary"],
-            f["expected_work"], f["actual_invoices"], f["total_spend"], f["flags"],
+            f["unit"], f["status"], f["context"], f["scope_claim"],
+            f["notes_summary"], f["expected_work"],
+            f["actual_invoices"], f["total_spend"], f["flags"],
         ] for f in findings]
 
         ws_cc.update("A1", out_rows, value_input_option="USER_ENTERED")
         _time.sleep(1)
 
-        # Format header row
         sid = ws_cc.id
+        NCOLS = 9
         fmt_requests = [
-            # Bold header
             {"repeatCell": {
                 "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
-                          "startColumnIndex": 0, "endColumnIndex": 8},
+                          "startColumnIndex": 0, "endColumnIndex": NCOLS},
                 "cell": {"userEnteredFormat": {
                     "backgroundColor": {"red": 0.118, "green": 0.220, "blue": 0.408},
                     "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1},
@@ -1125,34 +1337,36 @@ def crosscheck_meeting_notes_vs_invoices(gc, target_month):
                 }},
                 "fields": "userEnteredFormat(backgroundColor,textFormat,wrapStrategy)",
             }},
-            # Freeze header
             {"updateSheetProperties": {
                 "properties": {"sheetId": sid, "gridProperties": {"frozenRowCount": 1}},
                 "fields": "gridProperties.frozenRowCount",
             }},
-            # Wrap all data cells
             {"repeatCell": {
                 "range": {"sheetId": sid, "startRowIndex": 1,
                           "endRowIndex": len(out_rows) + 1,
-                          "startColumnIndex": 0, "endColumnIndex": 8},
+                          "startColumnIndex": 0, "endColumnIndex": NCOLS},
                 "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP"}},
                 "fields": "userEnteredFormat.wrapStrategy",
             }},
         ]
 
-        # Color rows by status
-        RED    = {"red": 1.0,  "green": 0.90, "blue": 0.90}
+        RED    = {"red": 1.0,  "green": 0.88, "blue": 0.88}
         AMBER  = {"red": 1.0,  "green": 0.95, "blue": 0.80}
         GREEN  = {"red": 0.85, "green": 0.93, "blue": 0.85}
         YELLOW = {"red": 1.0,  "green": 0.97, "blue": 0.80}
+        ORANGE = {"red": 1.0,  "green": 0.91, "blue": 0.77}  # repeat durable / creep
 
         for i, f in enumerate(findings):
-            row_idx = i + 1
+            row_idx   = i + 1
             has_flags = f["flags"] not in ("OK", "—")
+            repeat    = any(unit == f["unit"] for unit in flags_summary["repeat_durable"])
+            creep     = any(unit == f["unit"] for unit in flags_summary["premium_creep"])
             if "No Invoice" in f["status"]:
                 bg = AMBER
             elif "Not Discussed" in f["status"]:
                 bg = RED
+            elif repeat or creep:
+                bg = ORANGE
             elif has_flags:
                 bg = YELLOW
             else:
@@ -1160,13 +1374,12 @@ def crosscheck_meeting_notes_vs_invoices(gc, target_month):
             fmt_requests.append({"repeatCell": {
                 "range": {"sheetId": sid, "startRowIndex": row_idx,
                           "endRowIndex": row_idx + 1,
-                          "startColumnIndex": 0, "endColumnIndex": 8},
+                          "startColumnIndex": 0, "endColumnIndex": NCOLS},
                 "cell": {"userEnteredFormat": {"backgroundColor": bg}},
                 "fields": "userEnteredFormat.backgroundColor",
             }})
 
-        # Column widths
-        widths = [70, 130, 100, 300, 200, 260, 90, 300]
+        widths = [65, 120, 140, 90, 280, 180, 250, 85, 340]
         for col_i, w in enumerate(widths):
             fmt_requests.append({"updateDimensionProperties": {
                 "range": {"sheetId": sid, "dimension": "COLUMNS",
@@ -1184,12 +1397,14 @@ def crosscheck_meeting_notes_vs_invoices(gc, target_month):
 
     # ── Print summary ───────────────────────────────────────────────
     print(f"\n  Month: {month_label}  |  {len(all_units)} units reviewed")
-    print(f"  ✅ Clean match          : {len(flags_summary['clean'])}")
-    print(f"  ⚠️  No invoice received : {len(flags_summary['no_invoice'])} — {flags_summary['no_invoice']}")
-    print(f"  🔍 Not in meeting notes : {len(flags_summary['unmentioned'])} — {flags_summary['unmentioned']}")
-    print(f"  🚨 Easy turn overspend  : {len(flags_summary['easy_overspend'])} — {flags_summary['easy_overspend']}")
-    print(f"  📦 Unexpected categories: {len(flags_summary['unexpected_cat'])} — {flags_summary['unexpected_cat']}")
-    print(f"  🔧 Expected work missing: {len(flags_summary['scope_creep'])} — {flags_summary['scope_creep']}")
+    print(f"  ✅ Clean match           : {len(flags_summary['clean'])}")
+    print(f"  ⚠️  No invoice received  : {len(flags_summary['no_invoice'])} — {flags_summary['no_invoice']}")
+    print(f"  🔍 Not in meeting notes  : {len(flags_summary['unmentioned'])} — {flags_summary['unmentioned']}")
+    print(f"  🚨 Easy turn overspend   : {len(flags_summary['easy_overspend'])} — {flags_summary['easy_overspend']}")
+    print(f"  📦 Unexpected categories : {len(flags_summary['unexpected_cat'])} — {flags_summary['unexpected_cat']}")
+    print(f"  🔧 Expected work missing : {len(flags_summary['scope_creep'])} — {flags_summary['scope_creep']}")
+    print(f"  🔁 Repeat durable work   : {len(flags_summary['repeat_durable'])} — {flags_summary['repeat_durable']}")
+    print(f"  📈 Premium/cost creep    : {len(flags_summary['premium_creep'])} — {flags_summary['premium_creep']}")
 
 
 def _fmt_amt(n):
