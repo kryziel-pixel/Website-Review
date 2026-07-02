@@ -173,10 +173,60 @@ def read_conditions(gc):
     return result
 
 
-def build_html(raw_data, cond_data, out_path):
+def read_crosscheck(gc):
+    """Read Cross-Check tab. Returns dict: unit -> {status, context, flags, ...}."""
+    wb = gc.open_by_key(SPREADSHEET_ID)
+    try:
+        ws   = wb.worksheet("Cross-Check")
+        vals = ws.get_all_values()
+    except Exception:
+        return {}
+    if len(vals) < 2:
+        return {}
+
+    headers = [h.strip().lower() for h in vals[0]]
+    def col(kw):
+        for i, h in enumerate(headers):
+            if kw in h:
+                return i
+        return -1
+
+    unit_col    = col("unit")
+    status_col  = col("status")
+    context_col = col("context")
+    scope_col   = col("scope claim")
+    notes_col   = col("notes summary")
+    exp_col     = col("expected work")
+    actual_col  = col("actual invoices")
+    spend_col   = col("total spend")
+    flags_col   = col("flags")
+
+    result = {}
+    for row in vals[1:]:
+        def g(c): return row[c].strip() if c >= 0 and c < len(row) else ""
+        unit = norm_unit(g(unit_col))
+        if not unit:
+            continue
+        flags_raw = g(flags_col)
+        result[unit] = {
+            "status":        g(status_col),
+            "context":       g(context_col),
+            "scope_claim":   g(scope_col),
+            "notes_summary": g(notes_col),
+            "expected_work": g(exp_col),
+            "actual_invoices": g(actual_col),
+            "total_spend":   g(spend_col),
+            "flags":         flags_raw,
+            "flag_list":     [f.strip() for f in flags_raw.split("|") if f.strip() and f.strip() != "OK"],
+        }
+    return result
+
+
+def build_html(raw_data, cond_data, cc_data, out_path):
     generated = raw_data["generated"]
     raw_json  = json.dumps(raw_data,  separators=(',', ':'))
     cond_json = json.dumps(cond_data, separators=(',', ':'))
+    cc_json   = json.dumps(cc_data,   separators=(',', ':'))
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -251,6 +301,22 @@ def build_html(raw_data, cond_data, out_path):
   .summary-box .flag{{background:rgba(255,255,255,.15);border-left:3px solid #fbbf24;padding:8px 12px;border-radius:0 6px 6px 0;margin-top:10px;font-size:13px}}
   .summary-box .rec{{background:rgba(255,255,255,.1);border-left:3px solid #34d399;padding:8px 12px;border-radius:0 6px 6px 0;margin-top:6px;font-size:13px}}
 
+  /* ── Cross-check panel ── */
+  .cc-panel{{border-radius:8px;padding:14px 18px;margin-top:16px;border:1px solid #e2e8f0}}
+  .cc-panel.cc-ok{{background:#f0fdf4;border-color:#bbf7d0}}
+  .cc-panel.cc-warn{{background:#fffbeb;border-color:#fde68a}}
+  .cc-panel.cc-alert{{background:#fff7ed;border-color:#fed7aa}}
+  .cc-panel.cc-red{{background:#fef2f2;border-color:#fecaca}}
+  .cc-hdr{{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}}
+  .cc-hdr h4{{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}}
+  .cc-context{{font-size:11px;font-weight:600;padding:2px 10px;border-radius:10px;background:rgba(0,0,0,.07)}}
+  .cc-flag{{font-size:12px;line-height:1.6;padding:6px 10px;margin-bottom:6px;border-radius:6px;border-left:3px solid}}
+  .cc-flag.flag-warn{{background:#fef9c3;border-color:#ca8a04;color:#713f12}}
+  .cc-flag.flag-alert{{background:#fff3e0;border-color:#f97316;color:#7c2d12}}
+  .cc-flag.flag-red{{background:#fee2e2;border-color:#dc2626;color:#7f1d1d}}
+  .cc-flag.flag-info{{background:#eff6ff;border-color:#3b82f6;color:#1e3a8a}}
+  .cc-ok-msg{{font-size:12px;color:#16a34a;font-weight:600}}
+
   /* ── Meeting notes panel ── */
   .notes-panel{{background:#fafafa;border:1px solid #e2e8f0;border-radius:8px;padding:16px 18px;margin-top:16px}}
   .notes-panel .notes-hdr{{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}}
@@ -323,6 +389,7 @@ def build_html(raw_data, cond_data, out_path):
         <th>Last Invoice</th>
         <th>Status</th>
         <th>Conditions</th>
+        <th>Cross-Check</th>
       </tr></thead>
       <tbody id="unit-tbody"></tbody>
     </table>
@@ -344,6 +411,14 @@ def build_html(raw_data, cond_data, out_path):
         <h3>Spend Over Time</h3>
         <div class="chart-wrap"><canvas id="unit-time-chart"></canvas></div>
       </div>
+    </div>
+    <!-- Cross-check findings -->
+    <div class="cc-panel hidden" id="unit-cc-panel">
+      <div class="cc-hdr">
+        <h4 id="unit-cc-title"></h4>
+        <span class="cc-context" id="unit-cc-context"></span>
+      </div>
+      <div id="unit-cc-flags"></div>
     </div>
     <!-- Meeting notes -->
     <div class="notes-panel" id="unit-notes-panel">
@@ -461,6 +536,7 @@ def build_html(raw_data, cond_data, out_path):
 // ══════════════════════════════════════════════════════════════════
 const RAW  = {raw_json};
 const COND = {cond_json};
+const CC   = {cc_json};
 
 const fmt  = n => '$' + Math.round(n).toLocaleString();
 const fmtD = n => '$' + n.toFixed(2).replace(/\\B(?=(\\d{{3}})+(?!\\d))/g,',');
@@ -637,8 +713,12 @@ function renderUnitTable(){{
 
   document.getElementById('unit-count').textContent = `${{data.length}} units`;
   document.getElementById('unit-tbody').innerHTML = data.map(u=>{{
-    const st = unitStatus(u.unit);
+    const st  = unitStatus(u.unit);
+    const cc  = CC[u.unit];
     const notesBadge = u.hasNotes ? '<span class="badge purple">📋 Notes</span>' : '<span style="color:#cbd5e1">—</span>';
+    const ccBadge = cc && cc.flag_list && cc.flag_list.length
+      ? `<span class="badge red">⚑ ${{cc.flag_list.length}} flag${{cc.flag_list.length>1?'s':''}}</span>`
+      : (cc ? '<span class="badge green">✓ OK</span>' : '<span style="color:#cbd5e1">—</span>');
     return `<tr class="clickable" onclick="drillUnit('${{u.unit}}')">
       <td><strong>Unit ${{u.unit}}</strong></td>
       <td><strong>${{fmt(u.total)}}</strong></td>
@@ -647,6 +727,7 @@ function renderUnitTable(){{
       <td>${{u.lastDate||'—'}}</td>
       <td>${{statusBadge(st)}}</td>
       <td>${{notesBadge}}</td>
+      <td>${{ccBadge}}</td>
     </tr>`;
   }}).join('');
 }}
@@ -660,6 +741,71 @@ function sortUnits(col){{
   const ths = document.querySelectorAll('#unit-table th');
   if(ths[idx]) ths[idx].classList.add(unitSortDir>0?'sort-asc':'sort-desc');
   renderUnitTable();
+}}
+
+// ── Cross-check renderer ────────────────────────────────────────
+function renderCrossCheck(unit){{
+  const panel = document.getElementById('unit-cc-panel');
+  const cc    = CC[unit];
+
+  if(!cc){{
+    panel.classList.add('hidden');
+    return;
+  }}
+
+  panel.classList.remove('hidden','cc-ok','cc-warn','cc-alert','cc-red');
+
+  const flags = cc.flag_list || [];
+  const statusText = cc.status || '';
+
+  // Panel colour
+  if(flags.length === 0)                         panel.classList.add('cc-ok');
+  else if(statusText.includes('No Invoice'))     panel.classList.add('cc-warn');
+  else if(flags.some(f=>f.toLowerCase().includes('repeat')||f.toLowerCase().includes('creep')))
+                                                 panel.classList.add('cc-alert');
+  else                                           panel.classList.add('cc-warn');
+
+  // Title
+  const titleEl = document.getElementById('unit-cc-title');
+  const icon = flags.length===0 ? '✅' : statusText.includes('Not Discussed') ? '🔍' :
+               statusText.includes('No Invoice') ? '⚠️' : '⚑';
+  titleEl.textContent = `${{icon}} Cross-Check — ${{statusText.replace(/[✅⚠️🔍]/g,'').trim()}}`;
+  titleEl.style.color = flags.length===0 ? '#16a34a' : '#92400e';
+
+  // Context note badge
+  const ctxEl = document.getElementById('unit-cc-context');
+  ctxEl.textContent = cc.context && cc.context !== '—' ? cc.context : '';
+  ctxEl.style.display = ctxEl.textContent ? 'inline-block' : 'none';
+
+  // Flags list
+  const flagsEl = document.getElementById('unit-cc-flags');
+  if(flags.length === 0){{
+    flagsEl.innerHTML = '<div class="cc-ok-msg">No issues detected — notes and invoices are consistent.</div>';
+  }} else {{
+    flagsEl.innerHTML = flags.map(f=>{{
+      let cls = 'flag-warn';
+      const fl = f.toLowerCase();
+      if(fl.includes('repeat')||fl.includes('creep')||fl.includes('unexpected')) cls='flag-alert';
+      if(fl.includes('easy turn')||fl.includes('not discussed')) cls='flag-red';
+      if(fl.includes('expected but no invoice')||fl.includes('no invoice')) cls='flag-info';
+      return `<div class="cc-flag ${{cls}}">${{f}}</div>`;
+    }}).join('');
+
+    // Show expected vs actual if useful
+    if(cc.expected_work && cc.expected_work !== '—' && cc.actual_invoices && cc.actual_invoices !== '—'){{
+      flagsEl.innerHTML += `
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px;font-size:11px">
+          <div style="background:#f0f9ff;border-radius:6px;padding:8px">
+            <div style="font-weight:700;color:#0369a1;margin-bottom:4px">Expected from notes</div>
+            <div style="color:#374151">${{cc.expected_work}}</div>
+          </div>
+          <div style="background:#fafafa;border-radius:6px;padding:8px">
+            <div style="font-weight:700;color:#374151;margin-bottom:4px">Actual invoices billed</div>
+            <div style="color:#374151">${{cc.actual_invoices}}</div>
+          </div>
+        </div>`;
+    }}
+  }}
 }}
 
 // ── Meeting notes renderer ──────────────────────────────────────
@@ -751,6 +897,7 @@ function drillUnit(unit){{
     months.map(m=>byMonth[m]),
     {{legend:false,colors:'#3C6BA4'}}));
 
+  renderCrossCheck(unit);
   renderNotes(unit);
 
   document.getElementById('unit-invoices-tbody').innerHTML = rs
@@ -940,8 +1087,12 @@ def main():
     cond_data = read_conditions(gc)
     print(f"  {len(cond_data)} units with condition records")
 
+    print("Reading Cross-Check findings…")
+    cc_data = read_crosscheck(gc)
+    print(f"  {len(cc_data)} units with cross-check data")
+
     print(f"Building dashboard → {args.out}")
-    build_html(raw_data, cond_data, args.out)
+    build_html(raw_data, cond_data, cc_data, args.out)
 
 
 if __name__ == "__main__":
