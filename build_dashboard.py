@@ -19,7 +19,7 @@ from creekside_automation import (
     norm_unit, norm_amt, to_date,
 )
 
-SRC_SHEET   = "DATA Invoice by Location"
+SRC_SHEET   = "DATA Invoice By Location"
 UT_SHEET    = "Unit Turn Cost by Unit"
 COND_SHEET  = "Unit Conditions"
 OUT_FILE    = os.path.join(os.path.dirname(__file__), "creekside_dashboard.html")
