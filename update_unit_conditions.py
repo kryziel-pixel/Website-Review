@@ -184,9 +184,76 @@ def extract_unit_notes_structured(text, meeting_date_label):
     return units
 
 
+# Lines matching these patterns are scheduling/tenancy matters — not unit conditions
+_NON_CONDITION_PATTERNS = re.compile(
+    r'\b('
+    r'make.?ready\s+(completed?|done|finished|started|not\s+started|in\s+progress)'
+    r'|completed?\s+make.?ready'
+    r'|just\s+needs?\s+cleaning'   # keep "needs cleaning" but strip "just"? No — cleaning IS a condition
+    r'|switching\s+to\s+unit'
+    r'|skip(ped)?\s*[-—]'
+    r'|eviction'
+    r'|court\s+date'
+    r'|family\s+emergency'
+    r'|no\s+longer\s+working'
+    r'|will\s+be\s+out'
+    r'|no\s+payments?\s+since'
+    r'|resident\s+said\s+will\s+be\s+out'
+    r')\b',
+    re.IGNORECASE,
+)
+
+# A line is a physical condition if it mentions something tangible about the unit
+_CONDITION_KEYWORDS = re.compile(
+    r'\b('
+    r'leak|damage|mold|pest|roach|bug|infestation|flood|water|stain'
+    r'|crack|broken|broken|hole|missing|replaced?|repair|fix|issue|problem'
+    r'|paint|floor|carpet|plank|tile|ceiling|wall|door|window|hvac|a/?c|heat'
+    r'|appliance|stove|fridge|refrigerator|dishwasher|washer|dryer|disposal'
+    r'|cabinet|counter|sink|tub|toilet|shower|plumbing|electrical|outlet'
+    r'|cleaning|clean|trash|debris|odor|smell|smoke|biohazard'
+    r'|roof|exterior|balcony|patio|foundation|structural'
+    r')\b',
+    re.IGNORECASE,
+)
+
+
+def filter_physical_conditions(note_text, date_label):
+    """
+    Given a raw note block (starting with date_label), return only the lines
+    that describe physical unit conditions. Returns None if nothing remains.
+    """
+    lines = note_text.splitlines()
+    kept = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped == date_label:
+            continue
+        has_condition = bool(_CONDITION_KEYWORDS.search(stripped))
+        has_non_condition = bool(_NON_CONDITION_PATTERNS.search(stripped))
+        # Physical condition keyword always wins — keep the line
+        if has_condition:
+            kept.append(stripped)
+        # Drop lines that are purely scheduling/tenancy with no condition content
+        elif has_non_condition:
+            continue
+        # Keep other descriptive lines that aren't explicitly administrative
+        elif not re.search(
+            r'\b(completed?|started|not\s+started|in\s+progress|switching|skip(ped)?|eviction|court|emergency|no\s+longer|will\s+be\s+out)\b',
+            stripped, re.IGNORECASE
+        ):
+            if len(stripped) > 4:
+                kept.append(stripped)
+
+    if not kept:
+        return None
+    return date_label + "\n" + "\n".join(kept)
+
+
 def parse_meeting_notes(email_body, meeting_date_label):
     """
-    Master parser — runs both parsers and merges results.
+    Master parser — runs both parsers, merges results, then filters to
+    physical condition details only (strips evictions, skips, scheduling).
     Returns dict: unit_num -> formatted note string (starting with date).
     """
     text = email_body if not email_body.strip().startswith("<") else html_to_text(email_body)
@@ -202,7 +269,16 @@ def parse_meeting_notes(email_body, meeting_date_label):
         b = notes_b.get(u, "")
         merged[u] = a if len(a) >= len(b) else b
 
-    return merged
+    # Filter to physical conditions only
+    filtered = {}
+    for u, note in merged.items():
+        clean = filter_physical_conditions(note, meeting_date_label)
+        if clean:
+            filtered[u] = clean
+        else:
+            print(f"  [skip] Unit {u}: no physical condition details — not written to sheet")
+
+    return filtered
 
 
 # ── Sheet updater ────────────────────────────────────────────────────────────
