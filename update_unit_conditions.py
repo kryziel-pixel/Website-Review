@@ -207,12 +207,14 @@ _NON_CONDITION_PATTERNS = re.compile(
 _CONDITION_KEYWORDS = re.compile(
     r'\b('
     r'leak|damage|mold|pest|roach|bug|infestation|flood|water|stain'
-    r'|crack|broken|broken|hole|missing|replaced?|repair|fix|issue|problem'
+    r'|crack|broken|hole|missing|replaced?|repair|fix|issue|problem'
     r'|paint|floor|carpet|plank|tile|ceiling|wall|door|window|hvac|a/?c|heat'
     r'|appliance|stove|fridge|refrigerator|dishwasher|washer|dryer|disposal'
     r'|cabinet|counter|sink|tub|toilet|shower|plumbing|electrical|outlet'
-    r'|cleaning|clean|trash|debris|odor|smell|smoke|biohazard'
+    r'|cleaning|clean|trash|debris|couch|furniture|odor|smell|smoke|biohazard'
     r'|roof|exterior|balcony|patio|foundation|structural'
+    r'|no\s+major\s+damage|minor\s+repair|minor\s+damage|good\s+condition|flooring\s+(good|ok|fine)'
+    r'|materials?\s+needed|needs?\s+materials?'
     r')\b',
     re.IGNORECASE,
 )
