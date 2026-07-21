@@ -129,7 +129,3 @@ Builds additional analysis tab in the sheet. Run as needed.
 - The `Unit Conditions` tab structure should remain as-is; the system only writes to col D
 - Always push changes to branch `claude/creekside-unit-turn-automation-hykws7` (or the current active branch)
 
-## Key Contacts (from meeting emails)
-- **Starr Benn** — Property Manager (Richmark), walks units and sends condition updates
-- **Carter** — handles lender inspection follow-up
-- Emails go to: oaksmgr, wendy, sandra, milisa (Richmark); albert, daisy, kryziel, asset-management (Oak REI); matt (Picheny); justin, samantha (Skycastle); cjones, csnelling (Patmos)
