@@ -32,7 +32,7 @@ from collections import defaultdict
 # Constants — sheet names and spreadsheet ID
 # ---------------------------------------------------------------------------
 SPREADSHEET_ID   = "1qVJ3Nz4LCgZVKlWMLP8i2xj8F0tzD6ujGDBtGhM6JhM"
-SRC_SHEET        = "DATA Invoice by Location"
+SRC_SHEET        = "DATA Invoice By Location"
 DET_SHEET        = "Invoice by Detail Report"
 UT_SHEET         = "Unit Turn Cost by Unit"
 COND_SHEET       = "Unit Conditions"
@@ -550,7 +550,7 @@ def update_unit_turn_sheet(ws, new_rows, detail_map, target_month, wb_gs=None, d
 
     # Apply formatting: pastel banding per unit + red font for new month rows
     _apply_ut_formatting(ws, wb_gs=wb_gs or ws.spreadsheet, out_rows=out_rows, new_month_keys={
-        build_key(r["unit"], r["invoice"], r["description"]) for r in to_add
+        build_key(r["unit"], r["invoice"], r["desc"]) for r in to_add
     })
 
     return to_add
@@ -1583,7 +1583,7 @@ def main():
     # --- Step 9: Rebuild interactive dashboard ---
     try:
         from build_dashboard import main as build_dashboard
-        build_dashboard()
+        build_dashboard(argv=[])
         print("\n✅ Dashboard rebuilt.")
     except Exception as e:
         print(f"\n[WARN] Dashboard not rebuilt: {e}")

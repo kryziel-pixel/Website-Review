@@ -374,7 +374,7 @@ def run_from_email_body(email_body, meeting_date_label, dry_run=False):
         try:
             from build_dashboard import main as build_dashboard
             print("\nRebuilding dashboard with updated notes…")
-            build_dashboard()
+            build_dashboard(argv=[])
         except Exception as e:
             print(f"[WARN] Dashboard not rebuilt: {e}")
 

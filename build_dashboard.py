@@ -1071,10 +1071,10 @@ buildInvoicesPage();
     print(f"✅ Dashboard written to {out_path} ({len(html)//1024}KB)")
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Build Creekside dashboard HTML")
     parser.add_argument("--out", default=OUT_FILE, help="Output HTML file path")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     print("Connecting to Google Sheets…")
     gc = get_gspread_client()
