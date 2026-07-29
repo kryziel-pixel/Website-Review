@@ -118,6 +118,23 @@ def norm_inv(v):
     return s(v).upper()
 
 
+def dedupe_inv(v):
+    """Zero-agnostic comparison key for invoice numbers (Sheets strips leading
+    zeros from numeric-looking cells, so '011524696' and '11524696' must be
+    treated as the same invoice when checking for existing/duplicate rows)."""
+    digits = norm_inv(v).lstrip("0")
+    return digits or "0"
+
+
+def protect_leading_zero(v):
+    """Prefix with an apostrophe so Sheets stores numeric-looking invoice
+    numbers with a leading zero as literal text instead of stripping it."""
+    v = s(v)
+    if v.isdigit() and v.startswith("0") and len(v) > 1:
+        return "'" + v
+    return v
+
+
 def norm_desc(v):
     return re.sub(r"\s+", " ", s(v)).upper()
 
@@ -131,7 +148,7 @@ def norm_amt(v):
 
 def build_key(unit, inv, desc):
     """Dedup key: unit|invoice|description (no amount — sheet displays truncated values)."""
-    return f"{norm_unit(unit)}|{norm_inv(inv)}|{norm_desc(desc)}"
+    return f"{norm_unit(unit)}|{dedupe_inv(inv)}|{norm_desc(desc)}"
 
 
 def is_marketing(row_texts):
@@ -198,6 +215,8 @@ def parse_location_rows(path):
     c_amt   = col("Total", "Amount", "Net Amount")
     c_gl    = col("GL Acc Number", "GL Account", "Account")
     c_desc  = col("Description", "Memo")
+    c_qty   = col("Quantity", "Qty")
+    c_vendor = col("Vendor", "VendorName", "Vendor Name")
 
     kept = []
     removed = []
@@ -246,6 +265,8 @@ def parse_location_rows(path):
             "amount":       norm_amt(row.get(c_amt, "")) if c_amt else 0,
             "gl":           s(row.get(c_gl, "")) if c_gl else "",
             "description":  s(row.get(c_desc, "")) if c_desc else "",
+            "quantity":     s(row.get(c_qty, "1")) if c_qty else "1",
+            "vendor":       s(row.get(c_vendor, "")) if c_vendor else "",
             "category":     "Unit Turn",
         })
 
@@ -355,13 +376,14 @@ def update_src_sheet(ws, new_rows, removed_rows, dry_run=False):
         headers.append("Removal Reason")
         reason_idx = len(headers) - 1
 
-    # Build existing key set to avoid duplicates
+    # Build existing key set to avoid duplicates (zero-agnostic: Sheets strips
+    # leading zeros from numeric-looking invoice numbers on write)
     existing_inv = set()
     for row in all_vals[1:]:
         inv_val = row[3] if len(row) > 3 else ""
-        existing_inv.add(norm_inv(inv_val))
+        existing_inv.add(dedupe_inv(inv_val))
 
-    to_append = [r for r in new_rows if r["invoice"] not in existing_inv]
+    to_append = [r for r in new_rows if dedupe_inv(r["invoice"]) not in existing_inv]
 
     print(f"\n[{SRC_SHEET}]")
     print(f"  Existing rows : {len(all_vals) - 1}")
@@ -372,18 +394,23 @@ def update_src_sheet(ws, new_rows, removed_rows, dry_run=False):
     if dry_run or not to_append:
         return
 
+    # Actual sheet column order: PropertyName, ObjectName, ObjectType,
+    # InvoiceNumber, AccountingDate, GLAccountNumber, Description, Quantity,
+    # Total, Credit, VendorName, [Category, Removal Reason]
     append_data = []
     for r in to_append:
-        row_out = [""] * max(len(headers), 10)
+        row_out = [""] * max(len(headers), 11)
         row_out[0] = r["property"]
         row_out[1] = r["unit"]
         row_out[2] = r["obj_type"]
-        row_out[3] = r["invoice"]
-        row_out[4] = r["install_date"].strftime("%-m/%-d/%y") if r["install_date"] else ""
-        row_out[5] = r["acctg_date"].strftime("%-m/%-d/%y") if r["acctg_date"] else ""
-        row_out[6] = str(int(r["amount"])) if r["amount"] == int(r["amount"]) else str(r["amount"])
-        row_out[7] = r["gl"]
-        row_out[8] = r["description"]
+        row_out[3] = protect_leading_zero(r["invoice"])
+        row_out[4] = r["acctg_date"].strftime("%-m/%-d/%Y") if r["acctg_date"] else ""
+        row_out[5] = r["gl"]
+        row_out[6] = r["description"]
+        row_out[7] = r["quantity"]
+        row_out[8] = str(int(r["amount"])) if r["amount"] == int(r["amount"]) else str(r["amount"])
+        row_out[9] = ""
+        row_out[10] = r["vendor"]
         if cat_idx < len(row_out):
             row_out[cat_idx] = r["category"]
         append_data.append(row_out)
@@ -397,7 +424,14 @@ def update_src_sheet(ws, new_rows, removed_rows, dry_run=False):
 # ---------------------------------------------------------------------------
 
 def update_det_sheet(ws, detail_path, dry_run=False):
-    """Append new detail rows that don't already exist."""
+    """Append new detail rows that don't already exist.
+
+    Maps the source CSV to the sheet's actual columns by name — InvoiceNumber,
+    VendorName, VendorAbbreviation, InvoiceDate, AccountingDate, DueDate,
+    Description, Total, AmountPaid — rather than dumping the CSV's own
+    columns as-is, since the raw Resman export's column layout doesn't match
+    the sheet's.
+    """
     new_raw = load_csv(detail_path)
     all_vals = read_sheet_as_list(ws)
 
@@ -407,15 +441,36 @@ def update_det_sheet(ws, detail_path, dry_run=False):
         inv_col = header_index(headers, "InvoiceNumber", "Invoice Number", "Invoice #")
         for row in all_vals[1:]:
             if inv_col >= 0 and inv_col < len(row):
-                existing_inv.add(norm_inv(row[inv_col]))
+                existing_inv.add(dedupe_inv(row[inv_col]))
+
+    headers_new = list(new_raw[0].keys()) if new_raw else []
+    col = lambda *c: _find_col(headers_new, *c)
+    c_inv    = col("InvoiceNumber", "Invoice Number", "Invoice #")
+    c_vendor = col("VendorName", "Vendor Name", "Vendor")
+    c_vabbr  = col("VendorAbbreviation", "Vendor Abbreviation")
+    c_idate  = col("InvoiceDate", "Invoice Date")
+    c_adate  = col("AccountingDate", "Accounting Date", "Acctg Date")
+    c_ddate  = col("DueDate", "Due Date")
+    c_desc   = col("Description", "Memo")
+    c_total  = col("Total", "Amount")
+    c_paid   = col("AmountPaid", "Amount Paid")
 
     to_append = []
-    headers_new = list(new_raw[0].keys()) if new_raw else []
     for row in new_raw:
-        inv = norm_inv(row.get(_find_col(headers_new, "InvoiceNumber", "Invoice Number", "Invoice #") or "", ""))
-        if inv and inv not in existing_inv:
-            to_append.append(list(row.values()))
-            existing_inv.add(inv)
+        inv = norm_inv(row.get(c_inv, "")) if c_inv else ""
+        if inv and dedupe_inv(inv) not in existing_inv:
+            to_append.append([
+                protect_leading_zero(inv),
+                s(row.get(c_vendor, "")) if c_vendor else "",
+                s(row.get(c_vabbr, "")) if c_vabbr else "",
+                s(row.get(c_idate, "")) if c_idate else "",
+                s(row.get(c_adate, "")) if c_adate else "",
+                s(row.get(c_ddate, "")) if c_ddate else "",
+                s(row.get(c_desc, "")) if c_desc else "",
+                s(row.get(c_total, "")) if c_total else "",
+                s(row.get(c_paid, "")) if c_paid else "",
+            ])
+            existing_inv.add(dedupe_inv(inv))
 
     print(f"\n[{DET_SHEET}]")
     print(f"  New detail rows to append: {len(to_append)}")
@@ -525,7 +580,7 @@ def update_unit_turn_sheet(ws, new_rows, detail_map, target_month, wb_gs=None, d
         dup = key_counts[r["key"]] if key_counts[r["key"]] > 1 else ""
         out_rows.append([
             r["unit"],
-            r["invoice"],
+            protect_leading_zero(r["invoice"]),
             fmt_date(r.get("inv_date")),
             fmt_date(r.get("inst_date")),
             r["desc"],

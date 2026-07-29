@@ -54,16 +54,16 @@ def convert_location(path, out_path):
             "Unit#":         current_unit,
             "ObjectType":    current_obj_type or "Common Area",
             "Invoice #":     str(invoice or "").strip(),
-            "Install Date":  "",
             "Acctg Date":    acctg_date.strftime("%m/%d/%Y"),
-            "Total":         total if total is not None else 0,
             "GL Acc Number": str(gl or "").strip(),
             "Description":   str(desc or "").strip(),
+            "Quantity":      qty if qty is not None else 1,
+            "Total":         total if total is not None else 0,
             "Vendor":        str(vendor or "").strip(),
         })
 
-    fieldnames = ["PropertyName", "Unit#", "ObjectType", "Invoice #", "Install Date",
-                  "Acctg Date", "Total", "GL Acc Number", "Description", "Vendor"]
+    fieldnames = ["PropertyName", "Unit#", "ObjectType", "Invoice #",
+                  "Acctg Date", "GL Acc Number", "Description", "Quantity", "Total", "Vendor"]
     with open(out_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -77,19 +77,34 @@ def convert_detail(path, out_path):
     ws = wb[wb.sheetnames[0]]
     rows = list(ws.iter_rows(values_only=True))
 
+    current_vendor = ""
     out_rows = []
     for r in rows[6:]:
-        invoice = r[0]
-        invoice_date = r[1]
-        if invoice is None or not isinstance(invoice_date, datetime):
-            continue  # vendor header or GL-split sub-row
+        invoice, inv_date, _, acctg_date, due_date, desc, _, total = (list(r) + [None] * 8)[:8]
+
+        if invoice is not None and not isinstance(inv_date, datetime):
+            current_vendor = str(invoice).strip()
+            continue
+
+        if invoice is None or not isinstance(inv_date, datetime):
+            continue  # GL-split sub-row
+
         out_rows.append({
-            "InvoiceNumber": str(invoice).strip(),
-            "InvoiceDate":   invoice_date.strftime("%m/%d/%Y"),
+            "InvoiceNumber":       str(invoice).strip(),
+            "VendorName":          current_vendor,
+            "VendorAbbreviation":  "",
+            "InvoiceDate":         inv_date.strftime("%m/%d/%Y"),
+            "AccountingDate":      acctg_date.strftime("%m/%d/%Y") if isinstance(acctg_date, datetime) else "",
+            "DueDate":             due_date.strftime("%m/%d/%Y") if isinstance(due_date, datetime) else "",
+            "Description":         str(desc or "").strip(),
+            "Total":               total if total is not None else 0,
+            "AmountPaid":          "",
         })
 
+    fieldnames = ["InvoiceNumber", "VendorName", "VendorAbbreviation", "InvoiceDate",
+                  "AccountingDate", "DueDate", "Description", "Total", "AmountPaid"]
     with open(out_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["InvoiceNumber", "InvoiceDate"])
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(out_rows)
 
